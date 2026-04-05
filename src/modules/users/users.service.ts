@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { UpdateUserMeDto } from './dto/update-user-me.dto';
 
 @Injectable()
 export class UsersService {
@@ -12,6 +14,11 @@ export class UsersService {
         id: true,
         email: true,
         role: true,
+        displayName: true,
+        phone: true,
+        individualSubscriptionActive: true,
+        subscriptionExpiresAt: true,
+        planId: true,
         createdAt: true,
       },
     });
@@ -21,6 +28,36 @@ export class UsersService {
     }
 
     return user;
+  }
+
+  async updateMe(userId: string, dto: UpdateUserMeDto) {
+    const data: Prisma.UserUpdateInput = {};
+    if (dto.displayName !== undefined) {
+      data.displayName = dto.displayName;
+    }
+    if (dto.phone !== undefined) {
+      data.phone = dto.phone.trim() === '' ? null : dto.phone;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return this.findMe(userId);
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data,
+    });
+
+    return this.findMe(userId);
+  }
+
+  /** Demo / pre-payment: not exposed on generic PATCH /users/me. Replace with webhook-driven updates. */
+  async activateDemoIndividualSubscription(userId: string) {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { individualSubscriptionActive: true },
+    });
+    return this.findMe(userId);
   }
 
   async registerPushToken(userId: string, pushToken: string) {

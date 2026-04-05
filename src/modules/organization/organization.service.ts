@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Injectable, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { OrgMemberRole, OrganizationType } from '@prisma/client';
@@ -9,6 +9,17 @@ export class OrganizationService {
 
   /** Create a personal organization for a new user (used during registration) */
   async createPersonalForUser(userId: string): Promise<{ id: string; slug: string }> {
+    const existingMember = await this.prisma.organizationMember.findUnique({
+      where: { userId },
+      include: { organization: true },
+    });
+    if (existingMember) {
+      return {
+        id: existingMember.organizationId,
+        slug: existingMember.organization.slug,
+      };
+    }
+
     const slug = `personal-${userId.slice(0, 8)}`;
     const org = await this.prisma.organization.create({
       data: {
@@ -28,6 +39,15 @@ export class OrganizationService {
 
   /** Create organization (for business signup) */
   async create(userId: string, dto: CreateOrganizationDto) {
+    const alreadyMember = await this.prisma.organizationMember.findUnique({
+      where: { userId },
+    });
+    if (alreadyMember) {
+      throw new ConflictException(
+        'You already belong to an organization. Use a venue invite to switch organizations.',
+      );
+    }
+
     const slug = this.slugify(dto.name);
     const existingSlug = await this.prisma.organization.findUnique({ where: { slug } });
     const uniqueSlug = existingSlug ? `${slug}-${Date.now().toString(36)}` : slug;
@@ -57,31 +77,43 @@ export class OrganizationService {
     });
   }
 
-  /** Get primary/default org for user (first one they own) */
-  async getPrimaryOrgForUser(userId: string): Promise<string | null> {
-    const member = await this.prisma.organizationMember.findFirst({
-      where: { userId, role: OrgMemberRole.OWNER },
-      select: { organizationId: true },
-    });
-    return member?.organizationId ?? null;
-  }
-
   /** Ensure user has an org (create personal if none) - for legacy compatibility */
   async ensureUserHasOrg(userId: string): Promise<string> {
-    const orgId = await this.getPrimaryOrgForUser(userId);
-    if (orgId) return orgId;
+    const member = await this.prisma.organizationMember.findUnique({
+      where: { userId },
+      select: { organizationId: true },
+    });
+    if (member) {
+      return member.organizationId;
+    }
     const { id } = await this.createPersonalForUser(userId);
     return id;
   }
 
-  /** Check user has access to org */
+  /** Check user belongs to this organization (single membership per user) */
   async userHasAccess(userId: string, organizationId: string): Promise<boolean> {
     const member = await this.prisma.organizationMember.findUnique({
-      where: {
-        userId_organizationId: { userId, organizationId },
-      },
+      where: { userId },
     });
-    return !!member;
+    return member?.organizationId === organizationId;
+  }
+
+  /** OWNER or MANAGER may create/update venues for the organization */
+  async canManageOrganizationVenues(
+    userId: string,
+    organizationId: string,
+  ): Promise<boolean> {
+    const member = await this.prisma.organizationMember.findUnique({
+      where: { userId },
+      select: { role: true, organizationId: true },
+    });
+    if (!member || member.organizationId !== organizationId) {
+      return false;
+    }
+    return (
+      member.role === OrgMemberRole.OWNER ||
+      member.role === OrgMemberRole.MANAGER
+    );
   }
 
   private slugify(name: string): string {

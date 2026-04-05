@@ -37,7 +37,7 @@ async function main() {
       console.log(`Created ${role}: ${email}`);
     } else {
       const membership = await prisma.organizationMember.findUnique({
-        where: { userId_organizationId: { userId: existing.id, organizationId: defaultOrg.id } },
+        where: { userId: existing.id },
       });
       if (!membership) {
         await prisma.organizationMember.create({
@@ -48,6 +48,8 @@ async function main() {
           },
         });
         console.log(`Added ${email} to Default org`);
+      } else if (membership.organizationId !== defaultOrg.id) {
+        console.log(`Skip ${email}: already belongs to another organization`);
       } else {
         console.log(`Already exists, skipping: ${email}`);
       }

@@ -33,6 +33,17 @@ enum OrgMemberRole {
   MEMBER
 }
 
+enum OrganizationApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum EmergencyType {
+  PERSONAL
+  VENUE
+}
+
 model User {
   id               String                @id @default(uuid())
   email            String                @unique
@@ -40,12 +51,18 @@ model User {
   role             Role                  @default(USER)
   pushToken        String?
   emailVerifiedAt  DateTime?
+  displayName      String?
+  phone            String?
+  individualSubscriptionActive Boolean   @default(false)
+  subscriptionExpiresAt DateTime?
+  planId           String?
   createdAt        DateTime              @default(now())
   emergencies      EmergencySession[]
   assignedSessions EmergencySession[]    @relation("OperatorSessions")
   orgMemberships   OrganizationMember[]
   emergencyContacts EmergencyContact[]
   passwordResetTokens PasswordResetToken[]
+  organizationApplications OrganizationApplication[]
 }
 
 model Organization {
@@ -58,6 +75,7 @@ model Organization {
   members   OrganizationMember[]
   venues    Venue[]
   sessions  EmergencySession[]
+  approvedApplications OrganizationApplication[] @relation("ApplicationApprovedOrg")
 
   @@index([slug])
 }
@@ -90,7 +108,7 @@ model OrganizationMember {
   venue          Venue?       @relation(fields: [venueId], references: [id], onDelete: SetNull)
   createdAt      DateTime     @default(now())
 
-  @@unique([userId, organizationId])
+  @@unique([userId])
   @@index([organizationId])
   @@index([userId])
 }
@@ -104,6 +122,7 @@ model EmergencySession {
   venueId            String?
   venue              Venue?           @relation(fields: [venueId], references: [id], onDelete: SetNull)
   status             EmergencyStatus  @default(NEW)
+  emergencyType      EmergencyType    @default(PERSONAL)
   assignedOperatorId String?
   assignedOperator   User?            @relation("OperatorSessions", fields: [assignedOperatorId], references: [id])
   createdAt          DateTime         @default(now())
@@ -151,4 +170,40 @@ model PasswordResetToken {
 
   @@index([token])
   @@index([userId])
+}
+
+model OrganizationApplication {
+  id                 String                         @id @default(uuid())
+  userId             String
+  user               User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationName   String
+  organizationType   String
+  branches           Json
+  contactEmail       String
+  contactPhone       String
+  description        String?
+  status             OrganizationApplicationStatus  @default(PENDING)
+  rejectionReason    String?
+  approvedOrganizationId String?
+  approvedOrganization   Organization?              @relation("ApplicationApprovedOrg", fields: [approvedOrganizationId], references: [id], onDelete: SetNull)
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
+  attachments        OrganizationApplicationAttachment[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([approvedOrganizationId])
+}
+
+model OrganizationApplicationAttachment {
+  id            String                  @id @default(uuid())
+  applicationId String
+  application   OrganizationApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fileName      String
+  mimeType      String
+  sizeBytes     Int?
+  storageKey    String?
+  createdAt     DateTime                @default(now())
+
+  @@index([applicationId])
 }

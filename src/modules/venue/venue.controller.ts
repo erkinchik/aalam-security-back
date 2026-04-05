@@ -2,8 +2,6 @@ import { Controller, Get, Post, Body, Param, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../../common/guards/roles.guard';
-import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { VenueService } from './venue.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
@@ -23,9 +21,11 @@ export class VenueController {
   }
 
   @Post('organization/:organizationId')
-  @UseGuards(RolesGuard)
-  @Roles(Role.ADMIN)
-  @ApiOperation({ summary: 'Create a venue for an organization (ADMIN)' })
+  @ApiOperation({
+    summary: 'Create a venue for an organization',
+    description:
+      'Platform ADMIN bypasses org checks. Otherwise requires OWNER or MANAGER membership.',
+  })
   create(
     @CurrentUser() user: { id: string; role: string },
     @Param('organizationId') organizationId: string,
@@ -40,9 +40,11 @@ export class VenueController {
   }
 
   @Get('organization/:organizationId')
-  @UseGuards(RolesGuard)
-  @Roles(Role.ADMIN)
-  @ApiOperation({ summary: 'List venues of an organization (ADMIN)' })
+  @ApiOperation({
+    summary: 'List venues of an organization',
+    description:
+      'Platform ADMIN bypasses org checks. Otherwise requires membership in the organization.',
+  })
   listByOrganization(
     @CurrentUser() user: { id: string; role: string },
     @Param('organizationId') organizationId: string,

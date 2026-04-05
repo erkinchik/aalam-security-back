@@ -4,6 +4,7 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
+import { EmergencyType } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
@@ -20,27 +21,6 @@ export class EmergencyService {
   ) {}
 
   async startSession(userId: string, venueId?: string) {
-    if (!venueId) {
-      throw new ForbiddenException('venueId is required to start SOS');
-    }
-
-    const membership = await this.prisma.organizationMember.findFirst({
-      where: {
-        userId,
-        venueId,
-      },
-      include: {
-        organization: true,
-        venue: true,
-      },
-    });
-
-    if (!membership) {
-      throw new ForbiddenException(
-        'You must be bound to this venue (enter invite code) before sending SOS',
-      );
-    }
-
     const activeSession = await this.prisma.emergencySession.findFirst({
       where: {
         userId,
@@ -53,11 +33,44 @@ export class EmergencyService {
       return activeSession;
     }
 
+    let organizationId: string;
+    let sessionVenueId: string | null = null;
+    let emergencyType: EmergencyType = EmergencyType.PERSONAL;
+
+    if (venueId) {
+      const membership = await this.prisma.organizationMember.findFirst({
+        where: { userId, venueId },
+        include: { organization: true, venue: true },
+      });
+
+      if (!membership) {
+        throw new ForbiddenException(
+          'You must be bound to this venue (enter invite code) before sending SOS',
+        );
+      }
+
+      organizationId = membership.organizationId;
+      sessionVenueId = membership.venueId;
+      emergencyType = EmergencyType.VENUE;
+    } else {
+      const subscriber = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { individualSubscriptionActive: true },
+      });
+      if (!subscriber?.individualSubscriptionActive) {
+        throw new ForbiddenException(
+          'Activate an individual plan or bind to a venue to use SOS',
+        );
+      }
+      organizationId = await this.organizationService.ensureUserHasOrg(userId);
+    }
+
     const session = await this.prisma.emergencySession.create({
       data: {
         userId,
-        organizationId: membership.organizationId,
-        venueId: membership.venueId!,
+        organizationId,
+        venueId: sessionVenueId,
+        emergencyType,
       },
       include: {
         user: { select: { id: true, email: true, role: true } },

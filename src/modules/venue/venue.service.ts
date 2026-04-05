@@ -36,8 +36,15 @@ export class VenueService {
     isAdmin = false,
   ) {
     if (!isAdmin) {
-      const hasAccess = await this.organizationService.userHasAccess(userId, organizationId);
-      if (!hasAccess) throw new ForbiddenException('No access to this organization');
+      const canManage = await this.organizationService.canManageOrganizationVenues(
+        userId,
+        organizationId,
+      );
+      if (!canManage) {
+        throw new ForbiddenException(
+          'Only organization owners and managers can create venues',
+        );
+      }
     }
 
     const inviteCode = await this.ensureUniqueInviteCode();

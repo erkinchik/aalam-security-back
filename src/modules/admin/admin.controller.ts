@@ -20,6 +20,9 @@ import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { EmergenciesQueryDto } from './dto/emergencies-query.dto';
 import { AssignEmergencyDto } from './dto/assign-emergency.dto';
 import { CloseEmergencyDto } from './dto/close-emergency.dto';
+import { OrganizationApplicationsQueryDto } from './dto/organization-applications-query.dto';
+import { ApproveOrganizationApplicationDto } from './dto/approve-organization-application.dto';
+import { RejectOrganizationApplicationDto } from './dto/reject-organization-application.dto';
 
 @ApiTags('Admin')
 @ApiBearerAuth()
@@ -91,6 +94,40 @@ export class AdminController {
   @ApiOperation({ summary: 'Create organization (ADMIN only)' })
   createOrganization(@Body() dto: CreateOrganizationDto) {
     return this.adminService.createOrganization(dto);
+  }
+
+  @Get('organization-applications')
+  @ApiOperation({ summary: 'List organization applications (ADMIN only)' })
+  getOrganizationApplications(@Query() query: OrganizationApplicationsQueryDto) {
+    return this.adminService.getOrganizationApplications(query);
+  }
+
+  @Get('organization-applications/:id')
+  @ApiOperation({ summary: 'Get organization application by ID (ADMIN only)' })
+  getOrganizationApplicationById(@Param('id') id: string) {
+    return this.adminService.getOrganizationApplicationById(id);
+  }
+
+  @Post('organization-applications/:id/approve')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Approve application: create org, venues, owner membership (ADMIN only)',
+  })
+  approveOrganizationApplication(
+    @Param('id') id: string,
+    @Body() dto: ApproveOrganizationApplicationDto,
+  ) {
+    return this.adminService.approveOrganizationApplication(id, dto);
+  }
+
+  @Post('organization-applications/:id/reject')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reject pending application (ADMIN only)' })
+  rejectOrganizationApplication(
+    @Param('id') id: string,
+    @Body() dto: RejectOrganizationApplicationDto,
+  ) {
+    return this.adminService.rejectOrganizationApplication(id, dto);
   }
 
   @Post('users/create-operator')

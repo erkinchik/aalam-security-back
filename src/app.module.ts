@@ -17,6 +17,7 @@ import { PushModule } from './modules/push/push.module';
 import { OrganizationModule } from './modules/organization/organization.module';
 import { VenueModule } from './modules/venue/venue.module';
 import { EmergencyContactModule } from './modules/emergency-contact/emergency-contact.module';
+import { OrganizationApplicationModule } from './modules/organization-application/organization-application.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { EmergencyContactModule } from './modules/emergency-contact/emergency-co
     OrganizationModule,
     VenueModule,
     EmergencyContactModule,
+    OrganizationApplicationModule,
     EmergencyModule,
     DispatchModule,
     WebsocketModule,
