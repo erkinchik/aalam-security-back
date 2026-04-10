@@ -35,9 +35,7 @@ export class UsersService {
     if (dto.displayName !== undefined) {
       data.displayName = dto.displayName;
     }
-    if (dto.phone !== undefined) {
-      data.phone = dto.phone.trim() === '' ? null : dto.phone;
-    }
+    data.phone = dto.phone;
 
     if (Object.keys(data).length === 0) {
       return this.findMe(userId);

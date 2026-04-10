@@ -1,12 +1,5 @@
 import { Transform } from 'class-transformer';
-import {
-  IsString,
-  IsOptional,
-  IsBoolean,
-  IsEmail,
-  Matches,
-  ValidateIf,
-} from 'class-validator';
+import { IsString, IsOptional, IsBoolean, IsEmail, IsNotEmpty, Matches } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import {
   KYRGYZ_PHONE_MESSAGE,
@@ -19,12 +12,11 @@ export class CreateEmergencyContactDto {
   @IsString()
   name: string;
 
-  @ApiProperty({ example: '+996555123456', required: false })
-  @IsOptional()
-  @ValidateIf((_, v) => v !== undefined && v !== null && String(v).trim() !== '')
+  @ApiProperty({ example: '+996555123456' })
   @IsString()
+  @IsNotEmpty()
   @Matches(KYRGYZ_PHONE_REGEX, { message: KYRGYZ_PHONE_MESSAGE })
-  phone?: string;
+  phone: string;
 
   @ApiProperty({ example: 'john@example.com', required: false })
   @IsOptional()

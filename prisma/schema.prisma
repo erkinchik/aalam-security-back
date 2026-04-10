@@ -70,6 +70,8 @@ model Organization {
   name      String
   type      OrganizationType @default(PERSONAL)
   slug      String   @unique
+  /// Invite code for BUSINESS orgs (employees join without binding to a single venue). Null for PERSONAL.
+  inviteCode String? @unique
   createdAt DateTime @default(now())
 
   members   OrganizationMember[]

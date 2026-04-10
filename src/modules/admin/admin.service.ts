@@ -12,7 +12,7 @@ import {
   Role,
 } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
-import { generateInviteCode } from '../venue/utils/invite-code';
+import { generateUniqueInviteCodeAcrossTables } from '../venue/utils/invite-code';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { PushService } from '../push/push.service';
@@ -348,12 +348,18 @@ export class AdminService {
     const slug = this.organizationNameToSlug(dto.name);
     const existing = await this.prisma.organization.findUnique({ where: { slug } });
     const uniqueSlug = existing ? `${slug}-${Date.now().toString(36)}` : slug;
+    const type = dto.type ?? OrganizationType.BUSINESS;
+    const inviteCode =
+      type === OrganizationType.BUSINESS
+        ? await generateUniqueInviteCodeAcrossTables(this.prisma)
+        : undefined;
 
     return this.prisma.organization.create({
       data: {
         name: dto.name,
-        type: dto.type ?? 'BUSINESS',
+        type,
         slug: uniqueSlug,
+        inviteCode,
       },
     });
   }
@@ -458,11 +464,13 @@ export class AdminService {
     const uniqueSlug = existing ? `${slugBase}-${Date.now().toString(36)}` : slugBase;
 
     return this.prisma.$transaction(async (tx) => {
+      const orgInviteCode = await generateUniqueInviteCodeAcrossTables(tx);
       const org = await tx.organization.create({
         data: {
           name,
           type,
           slug: uniqueSlug,
+          inviteCode: orgInviteCode,
         },
       });
 
@@ -471,19 +479,7 @@ export class AdminService {
       });
 
       for (const br of branchRows) {
-        let inviteCode = '';
-        let codeOk = false;
-        for (let attempt = 0; attempt < 10; attempt++) {
-          inviteCode = generateInviteCode(6);
-          const taken = await tx.venue.findFirst({ where: { inviteCode } });
-          if (!taken) {
-            codeOk = true;
-            break;
-          }
-        }
-        if (!codeOk) {
-          throw new ConflictException('Failed to generate unique invite code');
-        }
+        const inviteCode = await generateUniqueInviteCodeAcrossTables(tx);
 
         await tx.venue.create({
           data: {

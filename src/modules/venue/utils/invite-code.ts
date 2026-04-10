@@ -1,5 +1,24 @@
+import { ConflictException } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
 /** Readable chars excluding 0, O, I, 1, L */
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+/** Unique among both Venue.inviteCode and Organization.inviteCode (case-sensitive storage). */
+export async function generateUniqueInviteCodeAcrossTables(
+  prisma: Pick<PrismaClient, 'venue' | 'organization'>,
+  length = 6,
+): Promise<string> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const code = generateInviteCode(length);
+    const [v, o] = await Promise.all([
+      prisma.venue.findFirst({ where: { inviteCode: code } }),
+      prisma.organization.findFirst({ where: { inviteCode: code } }),
+    ]);
+    if (!v && !o) return code;
+  }
+  throw new ConflictException('Failed to generate unique invite code');
+}
 
 export function generateInviteCode(length = 6): string {
   let result = '';

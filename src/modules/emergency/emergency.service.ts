@@ -56,25 +56,42 @@ export class EmergencyService {
         sessionVenueId = membership.venueId;
         emergencyType = EmergencyType.VENUE;
       } else {
-        const orgOwner = await this.prisma.organizationMember.findFirst({
+        const orgWideMember = await this.prisma.organizationMember.findFirst({
           where: {
             userId,
             organizationId: venue.organizationId,
-            role: OrgMemberRole.OWNER,
+            venueId: null,
+            role: { in: [OrgMemberRole.MEMBER, OrgMemberRole.MANAGER] },
           },
         });
         if (
-          !orgOwner ||
-          venue.organization.type !== OrganizationType.BUSINESS
+          orgWideMember &&
+          venue.organization.type === OrganizationType.BUSINESS
         ) {
-          throw new ForbiddenException(
-            'You must be bound to this venue (enter invite code) before sending SOS',
-          );
+          organizationId = venue.organizationId;
+          sessionVenueId = venue.id;
+          emergencyType = EmergencyType.VENUE;
+        } else {
+          const orgOwner = await this.prisma.organizationMember.findFirst({
+            where: {
+              userId,
+              organizationId: venue.organizationId,
+              role: OrgMemberRole.OWNER,
+            },
+          });
+          if (
+            !orgOwner ||
+            venue.organization.type !== OrganizationType.BUSINESS
+          ) {
+            throw new ForbiddenException(
+              'You must be bound to this venue (enter invite code) before sending SOS',
+            );
+          }
+          // Business owner: may request SOS for any venue of their org (no invite bind, no proximity check).
+          organizationId = venue.organizationId;
+          sessionVenueId = venue.id;
+          emergencyType = EmergencyType.VENUE;
         }
-        // Business owner: may request SOS for any venue of their org (no invite bind, no proximity check).
-        organizationId = venue.organizationId;
-        sessionVenueId = venue.id;
-        emergencyType = EmergencyType.VENUE;
       }
     } else {
       const subscriber = await this.prisma.user.findUnique({

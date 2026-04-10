@@ -2,13 +2,12 @@ import {
   Injectable,
   NotFoundException,
   ForbiddenException,
-  ConflictException,
 } from '@nestjs/common';
-import { OrgMemberRole } from '@prisma/client';
+import { OrgMemberRole, OrganizationType } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OrganizationService } from '../organization/organization.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
-import { generateInviteCode } from './utils/invite-code';
+import { generateUniqueInviteCodeAcrossTables } from './utils/invite-code';
 
 @Injectable()
 export class VenueService {
@@ -18,15 +17,7 @@ export class VenueService {
   ) {}
 
   private async ensureUniqueInviteCode(): Promise<string> {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const code = generateInviteCode(6);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const existing = await (this.prisma.venue as any).findFirst({
-        where: { inviteCode: code },
-      });
-      if (!existing) return code;
-    }
-    throw new ConflictException('Failed to generate unique invite code');
+    return generateUniqueInviteCodeAcrossTables(this.prisma);
   }
 
   async create(
@@ -42,14 +33,14 @@ export class VenueService {
       );
       if (!canManage) {
         throw new ForbiddenException(
-          'Only organization owners and managers can create venues',
+          'You do not have permission to create venues for this organization',
         );
       }
     }
 
     const inviteCode = await this.ensureUniqueInviteCode();
 
-    return (this.prisma.venue as any).create({
+    return this.prisma.venue.create({
       data: {
         organizationId,
         name: dto.name,
@@ -68,9 +59,40 @@ export class VenueService {
 
   async bindByInviteCode(userId: string, inviteCode: string) {
     const code = inviteCode.trim().toUpperCase();
-    const venue = await (this.prisma.venue as any).findFirst({
+
+    const org = await this.prisma.organization.findFirst({
+      where: {
+        inviteCode: { equals: code, mode: 'insensitive' },
+        type: OrganizationType.BUSINESS,
+      },
+      select: { id: true, name: true },
+    });
+
+    if (org) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.organizationMember.deleteMany({
+          where: { userId },
+        });
+
+        await tx.organizationMember.create({
+          data: {
+            userId,
+            organizationId: org.id,
+            venueId: null,
+            role: OrgMemberRole.MEMBER,
+          },
+        });
+      });
+
+      return {
+        bindType: 'organization' as const,
+        organization: { id: org.id, name: org.name },
+      };
+    }
+
+    const venue = await this.prisma.venue.findFirst({
       where: { inviteCode: { equals: code, mode: 'insensitive' } },
-      include: { organization: true },
+      include: { organization: { select: { id: true, name: true } } },
     });
 
     if (!venue) {
@@ -92,12 +114,19 @@ export class VenueService {
       });
     });
 
-    return this.prisma.venue.findUnique({
+    const full = await this.prisma.venue.findUnique({
       where: { id: venue.id },
       include: {
         organization: { select: { id: true, name: true } },
       },
     });
+
+    return {
+      bindType: 'venue' as const,
+      id: full!.id,
+      name: full!.name,
+      organization: full!.organization,
+    };
   }
 
   async listByOrganization(userId: string, organizationId: string, isAdmin = false) {

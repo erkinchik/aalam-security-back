@@ -2,6 +2,7 @@ import { Injectable, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { OrgMemberRole, OrganizationType } from '@prisma/client';
+import { generateUniqueInviteCodeAcrossTables } from '../venue/utils/invite-code';
 
 @Injectable()
 export class OrganizationService {
@@ -44,7 +45,7 @@ export class OrganizationService {
     });
     if (alreadyMember) {
       throw new ConflictException(
-        'You already belong to an organization. Use a venue invite to switch organizations.',
+        'You already belong to an organization. Use an organization or venue invite code to switch.',
       );
     }
 
@@ -52,11 +53,17 @@ export class OrganizationService {
     const existingSlug = await this.prisma.organization.findUnique({ where: { slug } });
     const uniqueSlug = existingSlug ? `${slug}-${Date.now().toString(36)}` : slug;
 
+    const inviteCode =
+      dto.type === OrganizationType.BUSINESS
+        ? await generateUniqueInviteCodeAcrossTables(this.prisma)
+        : undefined;
+
     return this.prisma.organization.create({
       data: {
         name: dto.name,
         type: dto.type,
         slug: uniqueSlug,
+        inviteCode,
         members: {
           create: { userId, role: OrgMemberRole.OWNER },
         },
@@ -98,7 +105,7 @@ export class OrganizationService {
     return member?.organizationId === organizationId;
   }
 
-  /** OWNER or MANAGER may create/update venues for the organization */
+  /** OWNER, MANAGER, or MEMBER may create venues for the organization */
   async canManageOrganizationVenues(
     userId: string,
     organizationId: string,
@@ -112,7 +119,8 @@ export class OrganizationService {
     }
     return (
       member.role === OrgMemberRole.OWNER ||
-      member.role === OrgMemberRole.MANAGER
+      member.role === OrgMemberRole.MANAGER ||
+      member.role === OrgMemberRole.MEMBER
     );
   }
 
