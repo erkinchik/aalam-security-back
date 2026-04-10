@@ -4,7 +4,7 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
-import { EmergencyType } from '@prisma/client';
+import { EmergencyType, OrganizationType, OrgMemberRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
@@ -38,26 +38,57 @@ export class EmergencyService {
     let emergencyType: EmergencyType = EmergencyType.PERSONAL;
 
     if (venueId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: venueId },
+        include: { organization: true },
+      });
+      if (!venue) {
+        throw new NotFoundException('Venue not found');
+      }
+
       const membership = await this.prisma.organizationMember.findFirst({
         where: { userId, venueId },
         include: { organization: true, venue: true },
       });
 
-      if (!membership) {
-        throw new ForbiddenException(
-          'You must be bound to this venue (enter invite code) before sending SOS',
-        );
+      if (membership) {
+        organizationId = membership.organizationId;
+        sessionVenueId = membership.venueId;
+        emergencyType = EmergencyType.VENUE;
+      } else {
+        const orgOwner = await this.prisma.organizationMember.findFirst({
+          where: {
+            userId,
+            organizationId: venue.organizationId,
+            role: OrgMemberRole.OWNER,
+          },
+        });
+        if (
+          !orgOwner ||
+          venue.organization.type !== OrganizationType.BUSINESS
+        ) {
+          throw new ForbiddenException(
+            'You must be bound to this venue (enter invite code) before sending SOS',
+          );
+        }
+        // Business owner: may request SOS for any venue of their org (no invite bind, no proximity check).
+        organizationId = venue.organizationId;
+        sessionVenueId = venue.id;
+        emergencyType = EmergencyType.VENUE;
       }
-
-      organizationId = membership.organizationId;
-      sessionVenueId = membership.venueId;
-      emergencyType = EmergencyType.VENUE;
     } else {
       const subscriber = await this.prisma.user.findUnique({
         where: { id: userId },
         select: { individualSubscriptionActive: true },
       });
-      if (!subscriber?.individualSubscriptionActive) {
+      const businessOwnerMembership = await this.prisma.organizationMember.findFirst({
+        where: { userId, role: OrgMemberRole.OWNER },
+        include: { organization: { select: { type: true } } },
+      });
+      const isBusinessOwner =
+        businessOwnerMembership?.organization.type === OrganizationType.BUSINESS;
+
+      if (!subscriber?.individualSubscriptionActive && !isBusinessOwner) {
         throw new ForbiddenException(
           'Activate an individual plan or bind to a venue to use SOS',
         );
@@ -111,9 +142,19 @@ export class EmergencyService {
       },
     });
 
+    const sessionForEmit = await this.prisma.emergencySession.findUnique({
+      where: { id: sessionId },
+      include: {
+        user: { select: { id: true, email: true, role: true } },
+        organization: true,
+        venue: true,
+        locations: { orderBy: { createdAt: 'desc' }, take: 30 },
+      },
+    });
+
     this.wsGateway.emitLocationUpdate(
       userId,
-      session as unknown as Record<string, unknown>,
+      (sessionForEmit ?? session) as unknown as Record<string, unknown>,
       location as unknown as Record<string, unknown>,
     );
 
@@ -168,7 +209,20 @@ export class EmergencyService {
         include: {
           user: { select: { id: true, email: true, role: true } },
           organization: { select: { id: true, name: true } },
-          venue: { select: { id: true, name: true } },
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
           locations: { orderBy: { createdAt: 'desc' as const }, take: 1 },
           assignedOperator: { select: { id: true, email: true } },
         },

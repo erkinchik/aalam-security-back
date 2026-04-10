@@ -63,7 +63,20 @@ export class AdminService {
         include: {
           user: { select: { id: true, email: true, role: true } },
           organization: { select: { id: true, name: true } },
-          venue: { select: { id: true, name: true } },
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
           locations: { orderBy: { createdAt: 'desc' }, take: 1 },
           assignedOperator: { select: { id: true, email: true } },
         },
@@ -83,7 +96,20 @@ export class AdminService {
       include: {
         user: { select: { id: true, email: true, role: true } },
         organization: { select: { id: true, name: true } },
-        venue: { select: { id: true, name: true } },
+        venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
         locations: { orderBy: { createdAt: 'desc' } },
         assignedOperator: { select: { id: true, email: true } },
       },
@@ -126,7 +152,20 @@ export class AdminService {
       include: {
         user: { select: { id: true, email: true, role: true } },
         organization: { select: { id: true, name: true } },
-        venue: { select: { id: true, name: true } },
+        venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
         assignedOperator: { select: { id: true, email: true } },
       },
     });
@@ -175,7 +214,20 @@ export class AdminService {
       include: {
         user: { select: { id: true, email: true, role: true } },
         organization: { select: { id: true, name: true } },
-        venue: { select: { id: true, name: true } },
+        venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
         assignedOperator: { select: { id: true, email: true } },
       },
     });
@@ -208,7 +260,20 @@ export class AdminService {
       include: {
         user: { select: { id: true, email: true, role: true } },
         organization: { select: { id: true, name: true } },
-        venue: { select: { id: true, name: true } },
+        venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
       },
     });
 
@@ -510,7 +575,20 @@ export class AdminService {
       include: {
         user: { select: { id: true, email: true, role: true } },
         organization: { select: { id: true, name: true } },
-        venue: { select: { id: true, name: true } },
+        venue: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              apartment: true,
+              floor: true,
+              entrance: true,
+              doorCode: true,
+              addressNotes: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
       },
     });
 
