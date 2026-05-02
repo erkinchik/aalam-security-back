@@ -1,6 +1,6 @@
 import { PrismaClient, OrgMemberRole, OrganizationType } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
-import { generateUniqueInviteCodeAcrossTables } from '../src/modules/venue/utils/invite-code';
+import { generateUniqueInviteCodeAcrossTables } from './lib/invite-code';
 
 const prisma = new PrismaClient();
 
