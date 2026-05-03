@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: postgres:15
@@ -33,6 +31,12 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+    restart: always
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/alarm_sos
       REDIS_HOST: redis
