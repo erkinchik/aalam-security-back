@@ -40,7 +40,7 @@ import { OrganizationApplicationModule } from './modules/organization-applicatio
     WebsocketModule,
     AdminModule,
     HealthModule,
-    CronModule,
+    // CronModule,
     PushModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
