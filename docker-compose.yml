@@ -4,10 +4,9 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: LetMiKnowDIDI2325!  # <-- СЛОЖНЫЙ ПАРОЛЬ
       POSTGRES_DB: alarm_sos
-    ports:
-      - "5432:5432"
+    # УДАЛИТЬ ports, чтобы закрыть базу от интернета!
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,19 +17,18 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0'     # Выделяем базе максимум 1 ядро
-          memory: 2G      # И не более 2 ГБ оперативной памяти
+          cpus: '1.0'
+          memory: 4G
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"   # Ограничиваем размер одного файла логов до 10 МБ
-        max-file: "3"     # Храним не более 3 таких файлов (старые удаляются)
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # УДАЛИТЬ ports для Redis, его тоже взламывают боты
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -39,8 +37,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.5'     # Redis очень легкий, ему хватит половины ядра
-          memory: 256M    # И 256 МБ памяти
+          cpus: '0.5'
+          memory: 256M
     logging:
       driver: "json-file"
       options:
@@ -52,20 +50,21 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3000:3000" # API оставляем открытым, это нужно для юзеров
     restart: always
     deploy:
       resources:
         limits:
-          cpus: '0.8'     # Не даем API забирать больше 80% ядра
-          memory: 1G      # Не более 1 ГБ памяти
+          cpus: '0.8'
+          memory: 1G
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/alarm_sos?connection_limit=5&pool_timeout=10
+      # УКАЖИ НОВЫЙ ПАРОЛЬ ЗДЕСЬ ТОЖЕ:
+      DATABASE_URL: postgresql://postgres:LetMiKnowDIDI2325!@postgres:5432/alarm_sos?connection_limit=5&pool_timeout=10
       REDIS_HOST: redis
       REDIS_PORT: 6379
       JWT_ACCESS_SECRET: super-secret-access-change-me
