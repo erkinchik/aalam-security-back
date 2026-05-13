@@ -75,30 +75,33 @@ export class WebsocketGateway
     location: Record<string, unknown>,
   ) {
     const payload = { session, location };
-    this.server.to('operators').emit('emergency:location_update', payload);
-    this.server.to(`user_${userId}`).emit('emergency:location_update', payload);
+    this.server
+      .to(['admin_room', 'operators', `user_${userId}`])
+      .emit('emergency:location_update', payload);
   }
 
   emitEmergencyAssigned(userId: string, session: Record<string, unknown>) {
-    this.server.to('operators').emit('emergency:assigned', session);
-    this.server.to(`user_${userId}`).emit('emergency:assigned', session);
+    this.server
+      .to(['admin_room', 'operators', `user_${userId}`])
+      .emit('emergency:assigned', session);
   }
 
   emitEmergencyClosed(userId: string, session: Record<string, unknown>) {
-    this.server.to('operators').emit('emergency:closed', session);
-    this.server.to(`user_${userId}`).emit('emergency:closed', session);
+    this.server
+      .to(['admin_room', 'operators', `user_${userId}`])
+      .emit('emergency:closed', session);
   }
 
   emitEmergencyInProgress(userId: string, session: Record<string, unknown>) {
-    this.server.to('operators').emit('emergency:in_progress', session);
-    this.server.to(`user_${userId}`).emit('emergency:in_progress', session);
+    this.server
+      .to(['admin_room', 'operators', `user_${userId}`])
+      .emit('emergency:in_progress', session);
   }
 
   emitEmergencyReassigned(session: Record<string, unknown>) {
-    this.server.to('operators').emit('emergency:reassigned', session);
+    const rooms: string[] = ['admin_room', 'operators'];
     const userId = session.userId as string | undefined;
-    if (userId) {
-      this.server.to(`user_${userId}`).emit('emergency:reassigned', session);
-    }
+    if (userId) rooms.push(`user_${userId}`);
+    this.server.to(rooms).emit('emergency:reassigned', session);
   }
 }
