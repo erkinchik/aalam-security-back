@@ -10,6 +10,11 @@ import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { OrganizationService } from '../organization/organization.service';
 import { CreateLocationDto } from './dto/create-location.dto';
+import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
+
+// REL-2: hold a Redis lock for this long to suppress concurrent SOS triggers
+// from the same user. 30 s is enough to cover normal request latency / retries.
+const SOS_TRIGGER_LOCK_TTL_SECONDS = 30;
 
 @Injectable()
 export class EmergencyService {
@@ -21,6 +26,34 @@ export class EmergencyService {
   ) {}
 
   async startSession(userId: string, venueId?: string) {
+    // REL-2: prevent SOS spam from a single user across concurrent retries.
+    // Held only around the read-then-create critical section.
+    const lockKey = `sos:trigger:${userId}`;
+    const acquired = await this.redis
+      .getClient()
+      .set(lockKey, '1', 'EX', SOS_TRIGGER_LOCK_TTL_SECONDS, 'NX');
+    if (!acquired) {
+      // Another concurrent trigger is in flight; return the active session if
+      // it's already been written, otherwise tell the client to back off.
+      const inFlight = await this.prisma.emergencySession.findFirst({
+        where: { userId, status: { not: 'CLOSED' } },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: true,
+        },
+      });
+      if (inFlight) return inFlight;
+      throw new ConflictException('SOS request is already being processed');
+    }
+
+    try {
+      return await this.startSessionLocked(userId, venueId);
+    } finally {
+      await this.redis.getClient().del(lockKey);
+    }
+  }
+
+  private async startSessionLocked(userId: string, venueId?: string) {
     const activeSession = await this.prisma.emergencySession.findFirst({
       where: {
         userId,
@@ -179,38 +212,37 @@ export class EmergencyService {
   }
 
   async closeSession(sessionId: string, userId: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
+    try {
+      // REL-1: scopes ownership + non-closed precondition into the where clause.
+      const updated = await this.prisma.emergencySession.update({
+        where: {
+          id: sessionId,
+          userId,
+          status: { not: 'CLOSED' },
+        },
+        data: {
+          status: 'CLOSED',
+          closedAt: new Date(),
+        },
+        include: { user: { select: { id: true, email: true, role: true } } },
+      });
 
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.userId !== userId) {
-      throw new ForbiddenException('Not your session');
-    }
-
-    if (session.status === 'CLOSED') {
+      await this.redis.removeActiveEmergency(sessionId);
+      this.wsGateway.emitEmergencyClosed(
+        userId,
+        updated as unknown as Record<string, unknown>,
+      );
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { userId: true, status: true },
+      });
+      if (!existing) throw new NotFoundException('Session not found');
+      if (existing.userId !== userId) throw new ForbiddenException('Not your session');
       throw new ConflictException('Session is already closed');
     }
-
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        status: 'CLOSED',
-        closedAt: new Date(),
-      },
-      include: { user: { select: { id: true, email: true, role: true } } },
-    });
-
-    await this.redis.removeActiveEmergency(sessionId);
-    this.wsGateway.emitEmergencyClosed(
-      userId,
-      updated as unknown as Record<string, unknown>,
-    );
-
-    return updated;
   }
 
   async getActiveSessions(operatorId: string, page: number, limit: number) {

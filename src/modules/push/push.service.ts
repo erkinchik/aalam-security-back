@@ -1,11 +1,49 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
+// Expo per-message ticket shape we care about.
+type ExpoTicket = {
+  status: 'ok' | 'error';
+  details?: { error?: string };
+  message?: string;
+};
+
 @Injectable()
 export class PushService {
+  private readonly logger = new Logger(PushService.name);
+
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * REL-5: parse Expo response and clear push tokens for which the device is
+   * no longer registered. Expo doesn't return HTTP 410 — it returns 200 with
+   * `data[i].details.error === 'DeviceNotRegistered'` per-message.
+   */
+  private async clearDeadTokens(tokens: string[], body: unknown): Promise<void> {
+    const tickets =
+      (body as { data?: ExpoTicket[] } | null)?.data ?? [];
+    const stale: string[] = [];
+    for (let i = 0; i < tickets.length; i++) {
+      const t = tickets[i];
+      if (
+        t?.status === 'error' &&
+        t.details?.error === 'DeviceNotRegistered' &&
+        tokens[i]
+      ) {
+        stale.push(tokens[i]);
+      }
+    }
+    if (stale.length === 0) return;
+    await this.prisma.user.updateMany({
+      where: { pushToken: { in: stale } },
+      data: { pushToken: null },
+    });
+    this.logger.warn(
+      `Cleared ${stale.length} stale push token(s) (DeviceNotRegistered)`,
+    );
+  }
 
   async sendSosAlert(sessionId: string, organizationId: string) {
     const operators = await this.prisma.organizationMember.findMany({
@@ -39,11 +77,14 @@ export class PushService {
         body: JSON.stringify(messages),
       });
       if (!res.ok) {
-        const body = await res.text();
-        console.error('[Push] Expo API error:', res.status, body);
+        const text = await res.text();
+        this.logger.error(`Expo API error ${res.status}: ${text}`);
+        return;
       }
+      const json = await res.json();
+      await this.clearDeadTokens(tokens, json);
     } catch (err) {
-      console.error('[Push] Failed to send:', err);
+      this.logger.error('Failed to send SOS push', err as Error);
     }
   }
 
@@ -55,26 +96,34 @@ export class PushService {
 
     if (!operator?.pushToken) return;
 
+    const tokens = [operator.pushToken];
+    const messages = [
+      {
+        to: operator.pushToken,
+        sound: 'default',
+        title: '📋 Вызов назначен',
+        body: 'Вам назначен новый вызов. Откройте приложение.',
+        data: { sessionId, type: 'emergency:assigned' },
+        channelId: 'sos-emergency',
+        priority: 'high',
+      },
+    ];
+
     try {
       const res = await fetch(EXPO_PUSH_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: operator.pushToken,
-          sound: 'default',
-          title: '📋 Вызов назначен',
-          body: 'Вам назначен новый вызов. Откройте приложение.',
-          data: { sessionId, type: 'emergency:assigned' },
-          channelId: 'sos-emergency',
-          priority: 'high',
-        }),
+        body: JSON.stringify(messages),
       });
       if (!res.ok) {
-        const body = await res.text();
-        console.error('[Push] Assignment Expo API error:', res.status, body);
+        const text = await res.text();
+        this.logger.error(`Expo API error ${res.status}: ${text}`);
+        return;
       }
+      const json = await res.json();
+      await this.clearDeadTokens(tokens, json);
     } catch (err) {
-      console.error('[Push] Failed to send assignment:', err);
+      this.logger.error('Failed to send assignment push', err as Error);
     }
   }
 }

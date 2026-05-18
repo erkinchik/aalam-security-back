@@ -53,6 +53,9 @@ model User {
   emailVerifiedAt  DateTime?
   displayName      String?
   phone            String?
+  phoneVerifiedAt  DateTime?
+  telegramId       String?               @unique
+  telegramUsername String?
   individualSubscriptionActive Boolean   @default(false)
   subscriptionExpiresAt DateTime?
   planId           String?

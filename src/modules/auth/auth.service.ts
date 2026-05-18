@@ -2,7 +2,9 @@ import {
   Injectable,
   ConflictException,
   UnauthorizedException,
+  BadRequestException,
   Logger,
+  OnModuleInit,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -13,13 +15,20 @@ import { RedisService } from '../../redis/redis.service';
 import { OrganizationService } from '../organization/organization.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { ConfirmTelegramVerificationDto } from './dto/confirm-telegram-verification.dto';
 
 const REFRESH_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 const RESET_TOKEN_EXPIRY_HOURS = 1;
+const BCRYPT_COST = 12;
+const PHONE_VERIFY_TTL_SECONDS = 10 * 60; // 10 minutes
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
   private readonly logger = new Logger(AuthService.name);
+
+  // Pre-hashed dummy password used to equalize bcrypt timing when the email
+  // doesn't exist (SEC-13). Computed once at startup.
+  private dummyHash = '';
 
   constructor(
     private readonly prisma: PrismaService,
@@ -28,6 +37,13 @@ export class AuthService {
     private readonly redis: RedisService,
     private readonly organizationService: OrganizationService,
   ) {}
+
+  async onModuleInit() {
+    this.dummyHash = await bcrypt.hash(
+      'placeholder-not-a-real-password',
+      BCRYPT_COST,
+    );
+  }
 
   async register(dto: RegisterDto) {
     const existing = await this.prisma.user.findUnique({
@@ -38,7 +54,7 @@ export class AuthService {
       throw new ConflictException('Email already registered');
     }
 
-    const hashedPassword = await bcrypt.hash(dto.password, 10);
+    const hashedPassword = await bcrypt.hash(dto.password, BCRYPT_COST);
 
     const user = await this.prisma.user.create({
       data: {
@@ -59,12 +75,12 @@ export class AuthService {
       where: { email: dto.email },
     });
 
-    if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
+    // Always run bcrypt.compare so timing doesn't leak whether the email
+    // exists (SEC-13). If user is missing, compare against the dummy hash.
+    const hashToCheck = user?.password ?? this.dummyHash;
+    const passwordValid = await bcrypt.compare(dto.password, hashToCheck);
 
-    const passwordValid = await bcrypt.compare(dto.password, user.password);
-    if (!passwordValid) {
+    if (!user || !passwordValid) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -72,34 +88,40 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
+    let payload: { sub: string; role: string };
     try {
-      const payload = this.jwtService.verify(refreshToken, {
+      payload = this.jwtService.verify(refreshToken, {
         secret: this.configService.get<string>('jwt.refreshSecret'),
       });
-
-      const isValid = await this.redis.isRefreshTokenValid(
-        payload.sub,
-        refreshToken,
-      );
-      if (!isValid) {
-        throw new UnauthorizedException('Refresh token revoked');
-      }
-
-      const user = await this.prisma.user.findUnique({
-        where: { id: payload.sub },
-      });
-
-      if (!user) {
-        throw new UnauthorizedException('User not found');
-      }
-
-      await this.redis.removeRefreshToken(payload.sub, refreshToken);
-
-      return this.generateTokens(user.id, user.role);
-    } catch (error) {
-      if (error instanceof UnauthorizedException) throw error;
+    } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
+
+    const isValid = await this.redis.isRefreshTokenValid(
+      payload.sub,
+      refreshToken,
+    );
+    if (!isValid) {
+      // SEC-12: token is JWT-valid but missing from Redis. That means it was
+      // either already rotated (replay of an old token) or revoked. Either
+      // way, treat as compromise and burn down every session for this user.
+      await this.redis.removeAllRefreshTokens(payload.sub);
+      this.logger.warn(
+        `Refresh-token reuse detected for user ${payload.sub}, revoked all sessions`,
+      );
+      throw new UnauthorizedException('Token revoked');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    await this.redis.removeRefreshToken(payload.sub, refreshToken);
+
+    return this.generateTokens(user.id, user.role);
   }
 
   async logout(userId: string, refreshToken: string) {
@@ -117,10 +139,15 @@ export class AuthService {
       data: { userId: user.id, token, expiresAt },
     });
 
-    const appUrl = this.configService.get<string>('app.url') || 'https://app.alarm-sos.com';
+    const appUrl = this.configService.get<string>('app.url') || 'https://app.sos-security.com';
     const resetLink = `${appUrl}/reset-password?token=${token}`;
-    // TODO: Integrate SendGrid/nodemailer to send email. For now log:
-    this.logger.debug(`Password reset link for ${email}: ${resetLink}`);
+    // TODO (FEAT-1): integrate SendGrid/Postmark/Mailgun.
+    // SEC-11: never log the full token. Print only a short prefix for audit.
+    this.logger.log(
+      `Password reset requested for ${email} (token prefix: ${token.slice(0, 6)}…)`,
+    );
+    // resetLink kept as a local — used by future mailer.
+    void resetLink;
 
     return { status: 'ok' };
   }
@@ -134,7 +161,7 @@ export class AuthService {
       throw new UnauthorizedException('Invalid or expired reset token');
     }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_COST);
     await this.prisma.$transaction([
       this.prisma.user.update({
         where: { id: record.userId },
@@ -144,6 +171,62 @@ export class AuthService {
     ]);
 
     return { status: 'ok' };
+  }
+
+  async startTelegramVerification(userId: string) {
+    const token = crypto.randomBytes(32).toString('hex');
+    await this.redis.setPhoneVerificationToken(
+      token,
+      userId,
+      PHONE_VERIFY_TTL_SECONDS,
+    );
+
+    const botUsername = this.configService.get<string>('telegram.botUsername');
+    const deepLink = `https://t.me/${botUsername}?start=${token}`;
+
+    return { token, deepLink };
+  }
+
+  async confirmTelegramVerification(dto: ConfirmTelegramVerificationDto) {
+    const userId = await this.redis.getPhoneVerificationUserId(dto.token);
+    if (!userId) {
+      throw new BadRequestException('Token expired or invalid');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      // Token outlived the user account — clean up and reject.
+      await this.redis.deletePhoneVerificationToken(dto.token);
+      throw new BadRequestException('Token expired or invalid');
+    }
+
+    if (user.phone && user.phone !== dto.phone) {
+      throw new BadRequestException('Phone mismatch');
+    }
+
+    // If telegramId already belongs to another account, refuse — one Telegram
+    // account verifies one user.
+    const existingTelegramUser = await this.prisma.user.findUnique({
+      where: { telegramId: dto.telegramId },
+    });
+    if (existingTelegramUser && existingTelegramUser.id !== userId) {
+      throw new BadRequestException('Telegram account already linked');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        phone: dto.phone,
+        phoneVerifiedAt: new Date(),
+        telegramId: dto.telegramId,
+        telegramUsername: dto.telegramUsername ?? null,
+      },
+    });
+    await this.redis.deletePhoneVerificationToken(dto.token);
+
+    this.logger.log(`Phone verified via Telegram for user ${userId}`);
+
+    return { success: true };
   }
 
   private async generateTokens(userId: string, role: string) {

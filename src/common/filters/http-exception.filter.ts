@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
+import * as Sentry from '@sentry/node';
 import { Request, Response } from 'express';
 
 const HTTP_STATUS_MESSAGES: Record<number, string> = {
@@ -41,6 +42,10 @@ export class HttpExceptionFilter implements ExceptionFilter {
         `${request.method} ${request.url} ${status}`,
         exception instanceof Error ? exception.stack : undefined,
       );
+      // PRD-6: ship 5xx to Sentry. No-op if Sentry wasn't initialised (no DSN).
+      Sentry.captureException(exception, {
+        tags: { route: `${request.method} ${request.route?.path ?? request.url}` },
+      });
     }
 
     const { message, errors } = this.normalizeResponse(rawResponse, status);

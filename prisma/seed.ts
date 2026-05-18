@@ -20,26 +20,34 @@ async function backfillBusinessOrgInviteCodes() {
 
 const SEED_USERS = [
   {
-    email: 'admin@alarm-sos.com',
-    password: 'admin123456',
+    email: 'admin@sos-security.com',
+    password: process.env.SEED_ADMIN_PASSWORD ?? 'admin123456',
     role: 'ADMIN' as const,
     phone: '+996555000001',
   },
   {
-    email: 'operator@alarm-sos.com',
-    password: 'operator123',
+    email: 'operator@sos-security.com',
+    password: process.env.SEED_OPERATOR_PASSWORD ?? 'operator123',
     role: 'OPERATOR' as const,
     phone: '+996555000002',
   },
   {
     email: 'user@example.com',
-    password: '123456',
+    password: process.env.SEED_USER_PASSWORD ?? '123456',
     role: 'USER' as const,
     phone: '+996555000003',
   },
 ];
 
 async function main() {
+  if (process.env.NODE_ENV === 'production' && process.env.ALLOW_PROD_SEED !== 'true') {
+    console.error(
+      'Refusing to run seed in NODE_ENV=production. ' +
+        'Set ALLOW_PROD_SEED=true (and SEED_*_PASSWORD env vars) to override.',
+    );
+    process.exit(1);
+  }
+
   let defaultOrg = await prisma.organization.findUnique({ where: { slug: 'default' } });
   if (!defaultOrg) {
     defaultOrg = await prisma.organization.create({

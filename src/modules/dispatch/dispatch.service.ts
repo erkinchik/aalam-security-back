@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
+import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 
 @Injectable()
 export class DispatchService {
@@ -17,37 +18,42 @@ export class DispatchService {
   ) {}
 
   async startProgress(sessionId: string, operatorId: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
+    try {
+      // REL-1: atomic conditional update — Prisma throws P2025 if no row
+      // matches (status moved away from ASSIGNED, operator reassigned, etc.).
+      const updated = await this.prisma.emergencySession.update({
+        where: {
+          id: sessionId,
+          status: 'ASSIGNED',
+          assignedOperatorId: operatorId,
+        },
+        data: { status: 'IN_PROGRESS' },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          assignedOperator: { select: { id: true, email: true } },
+        },
+      });
 
-    if (!session) {
-      throw new NotFoundException('Session not found');
+      this.wsGateway.emitEmergencyInProgress(
+        updated.userId,
+        updated as unknown as Record<string, unknown>,
+      );
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      // Disambiguate so the client gets a useful 404/403/409.
+      const session = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true, assignedOperatorId: true },
+      });
+      if (!session) throw new NotFoundException('Session not found');
+      if (session.assignedOperatorId !== operatorId) {
+        throw new ForbiddenException('You are not assigned to this session');
+      }
+      throw new ConflictException(
+        `Session must be in ASSIGNED status (current: ${session.status})`,
+      );
     }
-
-    if (session.assignedOperatorId !== operatorId) {
-      throw new ForbiddenException('You are not assigned to this session');
-    }
-
-    if (session.status !== 'ASSIGNED') {
-      throw new ConflictException('Session must be in ASSIGNED status');
-    }
-
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: { status: 'IN_PROGRESS' },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        assignedOperator: { select: { id: true, email: true } },
-      },
-    });
-
-    this.wsGateway.emitEmergencyInProgress(
-      updated.userId,
-      updated as unknown as Record<string, unknown>,
-    );
-
-    return updated;
   }
 
   async resolveSession(
@@ -55,42 +61,42 @@ export class DispatchService {
     operatorId: string,
     resolution: string,
   ) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
+    try {
+      const updated = await this.prisma.emergencySession.update({
+        where: {
+          id: sessionId,
+          status: { not: 'CLOSED' },
+          assignedOperatorId: operatorId,
+        },
+        data: {
+          status: 'CLOSED',
+          closedAt: new Date(),
+          resolution,
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          assignedOperator: { select: { id: true, email: true } },
+        },
+      });
 
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.assignedOperatorId !== operatorId) {
-      throw new ForbiddenException('You are not assigned to this session');
-    }
-
-    if (session.status === 'CLOSED') {
+      await this.redis.removeActiveEmergency(sessionId);
+      this.wsGateway.emitEmergencyClosed(
+        updated.userId,
+        updated as unknown as Record<string, unknown>,
+      );
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const session = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true, assignedOperatorId: true },
+      });
+      if (!session) throw new NotFoundException('Session not found');
+      if (session.assignedOperatorId !== operatorId) {
+        throw new ForbiddenException('You are not assigned to this session');
+      }
       throw new ConflictException('Session is already closed');
     }
-
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        status: 'CLOSED',
-        closedAt: new Date(),
-        resolution,
-      },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        assignedOperator: { select: { id: true, email: true } },
-      },
-    });
-
-    await this.redis.removeActiveEmergency(sessionId);
-    this.wsGateway.emitEmergencyClosed(
-      updated.userId,
-      updated as unknown as Record<string, unknown>,
-    );
-
-    return updated;
   }
 
   async getOperatorHistory(operatorId: string, page: number, limit: number) {

@@ -16,6 +16,9 @@ import { generateUniqueInviteCodeAcrossTables } from '../venue/utils/invite-code
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { PushService } from '../push/push.service';
+import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
+
+const BCRYPT_COST = 12;
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { EmergenciesQueryDto } from './dto/emergencies-query.dto';
@@ -123,18 +126,6 @@ export class AdminService {
   }
 
   async assignSession(sessionId: string, operatorId: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.status === 'CLOSED') {
-      throw new ConflictException('Session is already closed');
-    }
-
     const operator = await this.prisma.user.findUnique({
       where: { id: operatorId },
       select: { role: true },
@@ -143,16 +134,18 @@ export class AdminService {
       throw new BadRequestException('User is not an operator');
     }
 
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        assignedOperatorId: operatorId,
-        status: 'ASSIGNED',
-      },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: { select: { id: true, name: true } },
-        venue: {
+    try {
+      // REL-1: conditional update — fails if session was closed concurrently.
+      const updated = await this.prisma.emergencySession.update({
+        where: { id: sessionId, status: { not: 'CLOSED' } },
+        data: {
+          assignedOperatorId: operatorId,
+          status: 'ASSIGNED',
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: { select: { id: true, name: true } },
+          venue: {
             select: {
               id: true,
               name: true,
@@ -166,37 +159,28 @@ export class AdminService {
               longitude: true,
             },
           },
-        assignedOperator: { select: { id: true, email: true } },
-      },
-    });
+          assignedOperator: { select: { id: true, email: true } },
+        },
+      });
 
-    this.wsGateway.emitEmergencyAssigned(
-      updated.userId,
-      updated as unknown as Record<string, unknown>,
-    );
-
-    void this.pushService.sendAssignmentToOperator(sessionId, operatorId);
-
-    return updated;
+      this.wsGateway.emitEmergencyAssigned(
+        updated.userId,
+        updated as unknown as Record<string, unknown>,
+      );
+      void this.pushService.sendAssignmentToOperator(sessionId, operatorId);
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true },
+      });
+      if (!existing) throw new NotFoundException('Session not found');
+      throw new ConflictException(`Session is ${existing.status}`);
+    }
   }
 
   async reassignSession(sessionId: string, operatorId: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.status === 'CLOSED') {
-      throw new ConflictException('Session is already closed');
-    }
-
-    if (session.assignedOperatorId === operatorId) {
-      throw new BadRequestException('Session is already assigned to this operator');
-    }
-
     const operator = await this.prisma.user.findUnique({
       where: { id: operatorId },
       select: { role: true },
@@ -205,16 +189,22 @@ export class AdminService {
       throw new BadRequestException('User is not an operator');
     }
 
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        assignedOperatorId: operatorId,
-        status: 'ASSIGNED',
-      },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: { select: { id: true, name: true } },
-        venue: {
+    try {
+      // REL-1: also rejects re-assignment to the same operator atomically.
+      const updated = await this.prisma.emergencySession.update({
+        where: {
+          id: sessionId,
+          status: { not: 'CLOSED' },
+          assignedOperatorId: { not: operatorId },
+        },
+        data: {
+          assignedOperatorId: operatorId,
+          status: 'ASSIGNED',
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: { select: { id: true, name: true } },
+          venue: {
             select: {
               id: true,
               name: true,
@@ -228,39 +218,46 @@ export class AdminService {
               longitude: true,
             },
           },
-        assignedOperator: { select: { id: true, email: true } },
-      },
-    });
+          assignedOperator: { select: { id: true, email: true } },
+        },
+      });
 
-    this.wsGateway.emitEmergencyReassigned(updated as unknown as Record<string, unknown>);
-    void this.pushService.sendAssignmentToOperator(sessionId, operatorId);
-
-    return updated;
+      this.wsGateway.emitEmergencyReassigned(
+        updated as unknown as Record<string, unknown>,
+      );
+      void this.pushService.sendAssignmentToOperator(sessionId, operatorId);
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true, assignedOperatorId: true },
+      });
+      if (!existing) throw new NotFoundException('Session not found');
+      if (existing.status === 'CLOSED') {
+        throw new ConflictException('Session is already closed');
+      }
+      if (existing.assignedOperatorId === operatorId) {
+        throw new BadRequestException(
+          'Session is already assigned to this operator',
+        );
+      }
+      throw new ConflictException(`Session is ${existing.status}`);
+    }
   }
 
   async unassignSession(sessionId: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.status === 'CLOSED') {
-      throw new ConflictException('Session is already closed');
-    }
-
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        assignedOperatorId: null,
-        status: 'NEW',
-      },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: { select: { id: true, name: true } },
-        venue: {
+    try {
+      const updated = await this.prisma.emergencySession.update({
+        where: { id: sessionId, status: { not: 'CLOSED' } },
+        data: {
+          assignedOperatorId: null,
+          status: 'NEW',
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: { select: { id: true, name: true } },
+          venue: {
             select: {
               id: true,
               name: true,
@@ -274,12 +271,22 @@ export class AdminService {
               longitude: true,
             },
           },
-      },
-    });
+        },
+      });
 
-    this.wsGateway.emitEmergencyReassigned(updated as unknown as Record<string, unknown>);
-
-    return updated;
+      this.wsGateway.emitEmergencyReassigned(
+        updated as unknown as Record<string, unknown>,
+      );
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true },
+      });
+      if (!existing) throw new NotFoundException('Session not found');
+      throw new ConflictException('Session is already closed');
+    }
   }
 
   async getOperators(organizationId?: string) {
@@ -437,6 +444,8 @@ export class AdminService {
     id: string,
     dto?: ApproveOrganizationApplicationDto,
   ) {
+    // We still need basic data outside the transaction to compute the slug;
+    // the atomic guarantee comes from the conditional update at the end.
     const application = await this.prisma.organizationApplication.findUnique({
       where: { id },
     });
@@ -444,7 +453,6 @@ export class AdminService {
     if (!application) {
       throw new NotFoundException('Application not found');
     }
-
     if (application.status !== OrganizationApplicationStatus.PENDING) {
       throw new ConflictException(`Application is already ${application.status}`);
     }
@@ -463,48 +471,88 @@ export class AdminService {
     });
     const uniqueSlug = existing ? `${slugBase}-${Date.now().toString(36)}` : slugBase;
 
-    return this.prisma.$transaction(async (tx) => {
-      const orgInviteCode = await generateUniqueInviteCodeAcrossTables(tx);
-      const org = await tx.organization.create({
-        data: {
-          name,
-          type,
-          slug: uniqueSlug,
-          inviteCode: orgInviteCode,
-        },
-      });
-
-      await tx.organizationMember.deleteMany({
-        where: { userId: application.userId },
-      });
-
-      for (const br of branchRows) {
-        const inviteCode = await generateUniqueInviteCodeAcrossTables(tx);
-
-        await tx.venue.create({
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const orgInviteCode = await generateUniqueInviteCodeAcrossTables(tx);
+        const org = await tx.organization.create({
           data: {
-            organizationId: org.id,
-            name: br.name,
-            address: br.address || null,
-            inviteCode,
+            name,
+            type,
+            slug: uniqueSlug,
+            inviteCode: orgInviteCode,
           },
         });
-      }
 
-      await tx.organizationMember.create({
-        data: {
-          userId: application.userId,
-          organizationId: org.id,
-          role: OrgMemberRole.OWNER,
-        },
+        await tx.organizationMember.deleteMany({
+          where: { userId: application.userId },
+        });
+
+        for (const br of branchRows) {
+          const inviteCode = await generateUniqueInviteCodeAcrossTables(tx);
+
+          await tx.venue.create({
+            data: {
+              organizationId: org.id,
+              name: br.name,
+              address: br.address || null,
+              inviteCode,
+            },
+          });
+        }
+
+        await tx.organizationMember.create({
+          data: {
+            userId: application.userId,
+            organizationId: org.id,
+            role: OrgMemberRole.OWNER,
+          },
+        });
+
+        // REL-4: conditional final update inside the transaction. If another
+        // admin already approved/rejected this application after the initial
+        // read, P2025 fires and the whole transaction (org + venues + member)
+        // is rolled back — no orphaned org leak.
+        return tx.organizationApplication.update({
+          where: {
+            id,
+            status: OrganizationApplicationStatus.PENDING,
+          },
+          data: {
+            status: OrganizationApplicationStatus.APPROVED,
+            approvedOrganizationId: org.id,
+            rejectionReason: null,
+          },
+          include: {
+            user: { select: { id: true, email: true } },
+            attachments: true,
+            approvedOrganization: {
+              select: { id: true, name: true, slug: true, type: true },
+            },
+          },
+        } as any);
       });
+    } catch (err) {
+      if (isPrismaRowNotFound(err)) {
+        throw new ConflictException(
+          'Application was changed by another admin (no longer PENDING)',
+        );
+      }
+      throw err;
+    }
+  }
 
-      return tx.organizationApplication.update({
-        where: { id },
+  async rejectOrganizationApplication(
+    id: string,
+    dto?: RejectOrganizationApplicationDto,
+  ) {
+    try {
+      // REL-4: conditional update — fails with P2025 if another admin already
+      // decided this application.
+      return await this.prisma.organizationApplication.update({
+        where: { id, status: OrganizationApplicationStatus.PENDING },
         data: {
-          status: OrganizationApplicationStatus.APPROVED,
-          approvedOrganizationId: org.id,
-          rejectionReason: null,
+          status: OrganizationApplicationStatus.REJECTED,
+          rejectionReason: dto?.reason?.trim() || null,
         },
         include: {
           user: { select: { id: true, email: true } },
@@ -514,64 +562,31 @@ export class AdminService {
           },
         },
       } as any);
-    });
-  }
-
-  async rejectOrganizationApplication(
-    id: string,
-    dto?: RejectOrganizationApplicationDto,
-  ) {
-    const application = await this.prisma.organizationApplication.findUnique({
-      where: { id },
-    });
-
-    if (!application) {
-      throw new NotFoundException('Application not found');
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.organizationApplication.findUnique({
+        where: { id },
+        select: { status: true },
+      });
+      if (!existing) throw new NotFoundException('Application not found');
+      throw new ConflictException(`Application is already ${existing.status}`);
     }
-
-    if (application.status !== OrganizationApplicationStatus.PENDING) {
-      throw new ConflictException(`Application is already ${application.status}`);
-    }
-
-    return this.prisma.organizationApplication.update({
-      where: { id },
-      data: {
-        status: OrganizationApplicationStatus.REJECTED,
-        rejectionReason: dto?.reason?.trim() || null,
-      },
-      include: {
-        user: { select: { id: true, email: true } },
-        attachments: true,
-        approvedOrganization: { select: { id: true, name: true, slug: true, type: true } },
-      },
-    } as any);
   }
 
   async closeSessionAdmin(sessionId: string, resolution?: string) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      throw new NotFoundException('Session not found');
-    }
-
-    if (session.status === 'CLOSED') {
-      throw new ConflictException('Session is already closed');
-    }
-
-    const updated = await this.prisma.emergencySession.update({
-      where: { id: sessionId },
-      data: {
-        status: 'CLOSED',
-        closedAt: new Date(),
-        resolution: resolution ?? 'Closed by admin',
-        assignedOperatorId: null,
-      },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: { select: { id: true, name: true } },
-        venue: {
+    try {
+      const updated = await this.prisma.emergencySession.update({
+        where: { id: sessionId, status: { not: 'CLOSED' } },
+        data: {
+          status: 'CLOSED',
+          closedAt: new Date(),
+          resolution: resolution ?? 'Closed by admin',
+          assignedOperatorId: null,
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: { select: { id: true, name: true } },
+          venue: {
             select: {
               id: true,
               name: true,
@@ -585,16 +600,24 @@ export class AdminService {
               longitude: true,
             },
           },
-      },
-    });
+        },
+      });
 
-    await this.redis.removeActiveEmergency(sessionId);
-    this.wsGateway.emitEmergencyClosed(
-      session.userId,
-      updated as unknown as Record<string, unknown>,
-    );
-
-    return updated;
+      await this.redis.removeActiveEmergency(sessionId);
+      this.wsGateway.emitEmergencyClosed(
+        updated.userId,
+        updated as unknown as Record<string, unknown>,
+      );
+      return updated;
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { status: true },
+      });
+      if (!existing) throw new NotFoundException('Session not found');
+      throw new ConflictException('Session is already closed');
+    }
   }
 
   async createOperator(dto: CreateOperatorDto) {
@@ -606,7 +629,7 @@ export class AdminService {
       throw new ConflictException('Email already registered');
     }
 
-    const hashedPassword = await bcrypt.hash(dto.password, 10);
+    const hashedPassword = await bcrypt.hash(dto.password, BCRYPT_COST);
 
     const user = await this.prisma.user.create({
       data: {

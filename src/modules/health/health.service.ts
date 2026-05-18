@@ -1,4 +1,8 @@
 import { Injectable } from '@nestjs/common';
+import {
+  HealthIndicatorResult,
+  HealthIndicatorService,
+} from '@nestjs/terminus';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 
@@ -7,26 +11,27 @@ export class HealthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
+    private readonly indicator: HealthIndicatorService,
   ) {}
 
-  async check() {
-    let postgres = false;
-    let redis = false;
-
+  async pingPostgres(): Promise<HealthIndicatorResult> {
+    const i = this.indicator.check('postgres');
     try {
       await this.prisma.$queryRaw`SELECT 1`;
-      postgres = true;
-    } catch {}
+      return i.up();
+    } catch (err) {
+      return i.down({ message: (err as Error).message });
+    }
+  }
 
+  async pingRedis(): Promise<HealthIndicatorResult> {
+    const i = this.indicator.check('redis');
     try {
       const pong = await this.redis.getClient().ping();
-      redis = pong === 'PONG';
-    } catch {}
-
-    return {
-      status: postgres && redis ? 'ok' : 'degraded',
-      postgres,
-      redis,
-    };
+      if (pong !== 'PONG') return i.down({ message: `unexpected reply: ${pong}` });
+      return i.up();
+    } catch (err) {
+      return i.down({ message: (err as Error).message });
+    }
   }
 }

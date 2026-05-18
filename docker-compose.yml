@@ -1,16 +1,20 @@
+# Local-dev compose. Values are interpolated from `.env` in this directory
+# (see .env.example). Secrets are NEVER hardcoded here; for prod use
+# docker-compose.prod.yml + a separate .env on the VPS.
 services:
   postgres:
     image: postgres:15
     restart: unless-stopped
+    ports:
+      - "5432:5432"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: LetMiKnowDIDI2325!  # <-- СЛОЖНЫЙ ПАРОЛЬ
-      POSTGRES_DB: alarm_sos
-    # УДАЛИТЬ ports, чтобы закрыть базу от интернета!
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-alarm_sos}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -28,7 +32,8 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
-    # УДАЛИТЬ ports для Redis, его тоже взламывают боты
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -50,8 +55,10 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "3000:3000" # API оставляем открытым, это нужно для юзеров
-    restart: always
+      - "3000:3000"
+    restart: unless-stopped
+    env_file:
+      - .env
     deploy:
       resources:
         limits:
@@ -62,16 +69,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    environment:
-      # УКАЖИ НОВЫЙ ПАРОЛЬ ЗДЕСЬ ТОЖЕ:
-      DATABASE_URL: postgresql://postgres:LetMiKnowDIDI2325!@postgres:5432/alarm_sos?connection_limit=5&pool_timeout=10
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      JWT_ACCESS_SECRET: super-secret-access-change-me
-      JWT_REFRESH_SECRET: super-secret-refresh-change-me
-      JWT_ACCESS_EXPIRES: 15m
-      JWT_REFRESH_EXPIRES: 7d
-      PORT: 3000
     depends_on:
       postgres:
         condition: service_healthy

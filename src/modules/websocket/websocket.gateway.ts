@@ -8,10 +8,27 @@ import { Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
+import { PrismaService } from '../../prisma/prisma.service';
+
+// Origin-check function read at decorator-eval time. Re-reads process.env on
+// each request so an env reload doesn't require a rebuild. Allows requests
+// with no Origin header (native mobile clients).
+type OriginCallback = (err: Error | null, allow?: boolean) => void;
+function websocketOriginCheck(origin: string | undefined, cb: OriginCallback) {
+  if (!origin) return cb(null, true);
+  const allowed = (process.env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (allowed.length === 0 || allowed.includes(origin)) {
+    return cb(null, true);
+  }
+  return cb(new Error(`Origin ${origin} not allowed by CORS`), false);
+}
 
 @WebSocketGateway({
   namespace: '/ws',
-  cors: { origin: '*' },
+  cors: { origin: websocketOriginCheck, credentials: true },
 })
 export class WebsocketGateway
   implements OnGatewayConnection, OnGatewayDisconnect
@@ -24,6 +41,7 @@ export class WebsocketGateway
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
   ) {}
 
   async handleConnection(client: Socket) {
@@ -46,6 +64,9 @@ export class WebsocketGateway
       if (payload.role === 'ADMIN') {
         client.join('admin_room');
         this.logger.log(`Admin ${payload.sub} connected`);
+        // REL-6: replay open sessions so a reconnecting admin doesn't miss
+        // events emitted while they were disconnected.
+        void this.sendAdminBootstrap(client);
       } else if (payload.role === 'OPERATOR') {
         client.join('operators');
         this.logger.log(`Operator ${payload.sub} connected`);
@@ -55,6 +76,24 @@ export class WebsocketGateway
       }
     } catch {
       client.disconnect();
+    }
+  }
+
+  private async sendAdminBootstrap(client: Socket) {
+    try {
+      const sessions = await this.prisma.emergencySession.findMany({
+        where: { status: { in: ['NEW', 'ASSIGNED', 'IN_PROGRESS'] } },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: { select: { id: true, name: true } },
+          assignedOperator: { select: { id: true, email: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      });
+      client.emit('emergency:bootstrap', { sessions });
+    } catch (err) {
+      this.logger.error('Failed to send admin bootstrap snapshot', err as Error);
     }
   }
 
