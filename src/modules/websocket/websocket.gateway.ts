@@ -143,4 +143,24 @@ export class WebsocketGateway
     if (userId) rooms.push(`user_${userId}`);
     this.server.to(rooms).emit('emergency:reassigned', session);
   }
+
+  emitSubscriptionApproved(
+    userId: string,
+    payload: { requestId: string; expiresAt: Date | null },
+  ) {
+    this.server.to(`user_${userId}`).emit('subscription:approved', {
+      requestId: payload.requestId,
+      expiresAt: payload.expiresAt?.toISOString() ?? null,
+    });
+  }
+
+  emitSubscriptionRejected(
+    userId: string,
+    payload: { requestId: string; reason: string | null },
+  ) {
+    this.server.to(`user_${userId}`).emit('subscription:rejected', {
+      requestId: payload.requestId,
+      reason: payload.reason,
+    });
+  }
 }

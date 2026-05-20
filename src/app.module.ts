@@ -23,6 +23,7 @@ import { OrganizationModule } from './modules/organization/organization.module';
 import { VenueModule } from './modules/venue/venue.module';
 import { EmergencyContactModule } from './modules/emergency-contact/emergency-contact.module';
 import { OrganizationApplicationModule } from './modules/organization-application/organization-application.module';
+import { SubscriptionRequestModule } from './modules/subscription-request/subscription-request.module';
 
 @Module({
   imports: [
@@ -82,6 +83,7 @@ import { OrganizationApplicationModule } from './modules/organization-applicatio
     VenueModule,
     EmergencyContactModule,
     OrganizationApplicationModule,
+    SubscriptionRequestModule,
     EmergencyModule,
     DispatchModule,
     WebsocketModule,

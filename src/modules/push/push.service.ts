@@ -88,6 +88,63 @@ export class PushService {
     }
   }
 
+  async sendSubscriptionDecision(
+    userId: string,
+    decision: 'approved' | 'rejected',
+    payload: { requestId: string; expiresAt?: Date | null; reason?: string | null },
+  ) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { pushToken: true },
+    });
+    if (!user?.pushToken) return;
+
+    const tokens = [user.pushToken];
+    const title =
+      decision === 'approved' ? '✅ Подписка активирована' : '❌ Заявка отклонена';
+    const body =
+      decision === 'approved'
+        ? payload.expiresAt
+          ? `Подписка активна до ${payload.expiresAt.toLocaleDateString('ru-RU')}`
+          : 'Подписка активна'
+        : payload.reason
+          ? `Причина: ${payload.reason}`
+          : 'Ваша заявка на подписку отклонена';
+
+    const messages = [
+      {
+        to: user.pushToken,
+        sound: 'default',
+        title,
+        body,
+        data: {
+          type: `subscription:${decision}`,
+          requestId: payload.requestId,
+          expiresAt: payload.expiresAt?.toISOString(),
+        },
+        channelId: 'sos-emergency',
+        priority: 'high',
+      },
+    ];
+
+    try {
+      const res = await fetch(EXPO_PUSH_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(messages),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        this.logger.error(`Expo API error ${res.status}: ${text}`);
+        return;
+      }
+      const json = await res.json();
+      await this.clearDeadTokens(tokens, json);
+    } catch (err) {
+      this.logger.error('Failed to send subscription decision push', err as Error);
+    }
+  }
+
   async sendAssignmentToOperator(sessionId: string, operatorId: string) {
     const operator = await this.prisma.user.findUnique({
       where: { id: operatorId, role: 'OPERATOR' },

@@ -39,6 +39,12 @@ enum OrganizationApplicationStatus {
   REJECTED
 }
 
+enum SubscriptionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum EmergencyType {
   PERSONAL
   VENUE
@@ -66,6 +72,7 @@ model User {
   emergencyContacts EmergencyContact[]
   passwordResetTokens PasswordResetToken[]
   organizationApplications OrganizationApplication[]
+  subscriptionRequests SubscriptionRequest[]
 }
 
 model Organization {
@@ -203,6 +210,24 @@ model OrganizationApplication {
   @@index([userId])
   @@index([status])
   @@index([approvedOrganizationId])
+}
+
+model SubscriptionRequest {
+  id              String                    @id @default(uuid())
+  userId          String
+  user            User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comment         String?
+  status          SubscriptionRequestStatus @default(PENDING)
+  rejectionReason String?
+  approvedBy      String?
+  approvedAt      DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 model OrganizationApplicationAttachment {

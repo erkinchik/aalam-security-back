@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -23,6 +24,9 @@ import { CloseEmergencyDto } from './dto/close-emergency.dto';
 import { OrganizationApplicationsQueryDto } from './dto/organization-applications-query.dto';
 import { ApproveOrganizationApplicationDto } from './dto/approve-organization-application.dto';
 import { RejectOrganizationApplicationDto } from './dto/reject-organization-application.dto';
+import { SubscriptionRequestsQueryDto } from './dto/subscription-requests-query.dto';
+import { ApproveSubscriptionRequestDto } from './dto/approve-subscription-request.dto';
+import { RejectSubscriptionRequestDto } from './dto/reject-subscription-request.dto';
 
 @ApiTags('Admin')
 @ApiBearerAuth()
@@ -134,5 +138,41 @@ export class AdminController {
   @ApiOperation({ summary: 'Create a new operator account (ADMIN only)' })
   createOperator(@Body() dto: CreateOperatorDto) {
     return this.adminService.createOperator(dto);
+  }
+
+  @Get('subscription-requests')
+  @ApiOperation({ summary: 'List subscription requests (ADMIN only)' })
+  getSubscriptionRequests(@Query() query: SubscriptionRequestsQueryDto) {
+    return this.adminService.getSubscriptionRequests(query);
+  }
+
+  @Get('subscription-requests/:id')
+  @ApiOperation({ summary: 'Get subscription request by ID (ADMIN only)' })
+  getSubscriptionRequestById(@Param('id') id: string) {
+    return this.adminService.getSubscriptionRequestById(id);
+  }
+
+  @Post('subscription-requests/:id/approve')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Approve subscription request: activates user subscription until expiresAt (default +30 days) (ADMIN only)',
+  })
+  approveSubscriptionRequest(
+    @CurrentUser() admin: { id: string },
+    @Param('id') id: string,
+    @Body() dto: ApproveSubscriptionRequestDto,
+  ) {
+    return this.adminService.approveSubscriptionRequest(id, admin.id, dto);
+  }
+
+  @Post('subscription-requests/:id/reject')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reject pending subscription request (ADMIN only)' })
+  rejectSubscriptionRequest(
+    @Param('id') id: string,
+    @Body() dto: RejectSubscriptionRequestDto,
+  ) {
+    return this.adminService.rejectSubscriptionRequest(id, dto);
   }
 }

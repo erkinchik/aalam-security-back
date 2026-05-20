@@ -10,6 +10,7 @@ import {
   OrganizationApplicationStatus,
   OrganizationType,
   Role,
+  SubscriptionRequestStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { generateUniqueInviteCodeAcrossTables } from '../venue/utils/invite-code';
@@ -25,6 +26,9 @@ import { EmergenciesQueryDto } from './dto/emergencies-query.dto';
 import { OrganizationApplicationsQueryDto } from './dto/organization-applications-query.dto';
 import { ApproveOrganizationApplicationDto } from './dto/approve-organization-application.dto';
 import { RejectOrganizationApplicationDto } from './dto/reject-organization-application.dto';
+import { SubscriptionRequestsQueryDto } from './dto/subscription-requests-query.dto';
+import { ApproveSubscriptionRequestDto } from './dto/approve-subscription-request.dto';
+import { RejectSubscriptionRequestDto } from './dto/reject-subscription-request.dto';
 
 const HEARTBEAT_TTL_SECONDS = 30;
 const ONLINE_THRESHOLD_MS = (HEARTBEAT_TTL_SECONDS + 5) * 1000;
@@ -646,5 +650,170 @@ export class AdminService {
     });
 
     return user;
+  }
+
+  // -------------------- Subscription requests --------------------
+
+  async getSubscriptionRequests(query: SubscriptionRequestsQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const where: { status?: SubscriptionRequestStatus } = {};
+    if (query.status != null) {
+      where.status = query.status;
+    }
+    const skip = (page - 1) * limit;
+
+    const [data, total] = await Promise.all([
+      this.prisma.subscriptionRequest.findMany({
+        where,
+        include: {
+          user: {
+            select: { id: true, email: true, phone: true, displayName: true },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.subscriptionRequest.count({ where }),
+    ]);
+
+    return { data, total, page, limit };
+  }
+
+  async getSubscriptionRequestById(id: string) {
+    const request = await this.prisma.subscriptionRequest.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: { id: true, email: true, phone: true, displayName: true },
+        },
+      },
+    });
+    if (!request) {
+      throw new NotFoundException('Subscription request not found');
+    }
+    let approvedByUser: { id: string; email: string } | null = null;
+    if (request.approvedBy) {
+      approvedByUser = await this.prisma.user.findUnique({
+        where: { id: request.approvedBy },
+        select: { id: true, email: true },
+      });
+    }
+    return { ...request, approvedByUser };
+  }
+
+  async approveSubscriptionRequest(
+    id: string,
+    adminId: string,
+    dto?: ApproveSubscriptionRequestDto,
+  ) {
+    const expiresAt = dto?.expiresAt
+      ? new Date(dto.expiresAt)
+      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    if (Number.isNaN(expiresAt.getTime())) {
+      throw new BadRequestException('Invalid expiresAt');
+    }
+    if (expiresAt.getTime() <= Date.now()) {
+      throw new BadRequestException('expiresAt must be in the future');
+    }
+
+    let approved;
+    try {
+      approved = await this.prisma.$transaction(async (tx) => {
+        // REL-4: conditional update — fails with P2025 if another admin already
+        // decided the request.
+        const req = await tx.subscriptionRequest.update({
+          where: { id, status: SubscriptionRequestStatus.PENDING },
+          data: {
+            status: SubscriptionRequestStatus.APPROVED,
+            approvedBy: adminId,
+            approvedAt: new Date(),
+            expiresAt,
+            rejectionReason: null,
+          },
+        });
+
+        await tx.user.update({
+          where: { id: req.userId },
+          data: {
+            individualSubscriptionActive: true,
+            subscriptionExpiresAt: expiresAt,
+          },
+        });
+
+        return req;
+      });
+    } catch (err) {
+      if (isPrismaRowNotFound(err)) {
+        const existing = await this.prisma.subscriptionRequest.findUnique({
+          where: { id },
+          select: { status: true },
+        });
+        if (!existing) {
+          throw new NotFoundException('Subscription request not found');
+        }
+        throw new ConflictException(
+          `Subscription request is already ${existing.status}`,
+        );
+      }
+      throw err;
+    }
+
+    // Notify outside the transaction. Failures here must not roll back approval.
+    this.wsGateway.emitSubscriptionApproved(approved.userId, {
+      requestId: approved.id,
+      expiresAt: approved.expiresAt,
+    });
+    void this.pushService.sendSubscriptionDecision(
+      approved.userId,
+      'approved',
+      { requestId: approved.id, expiresAt: approved.expiresAt },
+    );
+
+    return this.getSubscriptionRequestById(approved.id);
+  }
+
+  async rejectSubscriptionRequest(
+    id: string,
+    dto?: RejectSubscriptionRequestDto,
+  ) {
+    let rejected;
+    try {
+      rejected = await this.prisma.subscriptionRequest.update({
+        where: { id, status: SubscriptionRequestStatus.PENDING },
+        data: {
+          status: SubscriptionRequestStatus.REJECTED,
+          rejectionReason: dto?.rejectionReason?.trim() || null,
+        },
+      });
+    } catch (err) {
+      if (isPrismaRowNotFound(err)) {
+        const existing = await this.prisma.subscriptionRequest.findUnique({
+          where: { id },
+          select: { status: true },
+        });
+        if (!existing) {
+          throw new NotFoundException('Subscription request not found');
+        }
+        throw new ConflictException(
+          `Subscription request is already ${existing.status}`,
+        );
+      }
+      throw err;
+    }
+
+    this.wsGateway.emitSubscriptionRejected(rejected.userId, {
+      requestId: rejected.id,
+      reason: rejected.rejectionReason,
+    });
+    void this.pushService.sendSubscriptionDecision(
+      rejected.userId,
+      'rejected',
+      { requestId: rejected.id, reason: rejected.rejectionReason },
+    );
+
+    return this.getSubscriptionRequestById(rejected.id);
   }
 }
