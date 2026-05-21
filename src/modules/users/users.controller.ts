@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -55,6 +56,19 @@ export class UsersController {
   })
   demoActivateSubscription(@CurrentUser() user: { id: string }) {
     return this.usersService.activateDemoIndividualSubscription(user.id);
+  }
+
+  @Delete('me')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(RolesGuard)
+  @Roles(Role.USER)
+  @ApiOperation({
+    summary: 'Permanently delete the current user account (Apple 5.1.1(v))',
+    description:
+      'Anonymizes all PII, revokes refresh tokens and removes pending requests/memberships. Historical emergency sessions are kept for audit but de-linked from PII. Operation is irreversible. Blocked if the user has an active SOS session or non-USER role.',
+  })
+  deleteMe(@CurrentUser() user: { id: string }) {
+    return this.usersService.deleteAccount(user.id);
   }
 
   @Patch('me/push-token')

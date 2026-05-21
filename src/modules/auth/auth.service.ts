@@ -80,7 +80,9 @@ export class AuthService implements OnModuleInit {
     const hashToCheck = user?.password ?? this.dummyHash;
     const passwordValid = await bcrypt.compare(dto.password, hashToCheck);
 
-    if (!user || !passwordValid) {
+    if (!user || !passwordValid || user.deletedAt) {
+      // Deleted users are rejected with the same error to avoid leaking that
+      // a previously-existing account was deleted.
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -115,7 +117,7 @@ export class AuthService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
     });
-    if (!user) {
+    if (!user || user.deletedAt) {
       throw new UnauthorizedException('User not found');
     }
 
@@ -131,7 +133,7 @@ export class AuthService implements OnModuleInit {
 
   async forgotPassword(email: string) {
     const user = await this.prisma.user.findUnique({ where: { email } });
-    if (!user) return { status: 'ok' }; // Don't reveal if email exists
+    if (!user || user.deletedAt) return { status: 'ok' }; // Don't reveal if email exists / was deleted
 
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + RESET_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);

@@ -65,6 +65,7 @@ model User {
   individualSubscriptionActive Boolean   @default(false)
   subscriptionExpiresAt DateTime?
   planId           String?
+  deletedAt        DateTime?
   createdAt        DateTime              @default(now())
   emergencies      EmergencySession[]
   assignedSessions EmergencySession[]    @relation("OperatorSessions")
@@ -129,6 +130,8 @@ model OrganizationMember {
   @@index([organizationId])
   @@index([userId])
 }
+
+
 
 model EmergencySession {
   id                 String           @id @default(uuid())
