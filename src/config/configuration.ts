@@ -64,6 +64,24 @@ function parseAllowedOrigins(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Parse durations like '15m', '7d', '365d', '3600s' into seconds.
+ * Used to derive Redis TTL from the JWT lifetime so they always match —
+ * a refresh token outliving its Redis entry would still be silently rejected.
+ */
+function parseDurationSeconds(raw: string, fallbackSeconds: number): number {
+  const m = /^(\d+)([smhd])$/.exec(raw.trim());
+  if (!m) return fallbackSeconds;
+  const n = parseInt(m[1], 10);
+  switch (m[2]) {
+    case 's': return n;
+    case 'm': return n * 60;
+    case 'h': return n * 3600;
+    case 'd': return n * 86400;
+    default:  return fallbackSeconds;
+  }
+}
+
 export default () => ({
   nodeEnv: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
@@ -90,6 +108,13 @@ export default () => ({
     refreshSecret: process.env.JWT_REFRESH_SECRET,
     accessExpires: process.env.JWT_ACCESS_EXPIRES || '15m',
     refreshExpires: process.env.JWT_REFRESH_EXPIRES || '7d',
+    // Redis stores refresh tokens with the same TTL as the JWT lifetime so
+    // they expire together. Otherwise a still-valid JWT may be silently
+    // rejected because Redis evicted its record first.
+    refreshTtlSeconds: parseDurationSeconds(
+      process.env.JWT_REFRESH_EXPIRES || '7d',
+      7 * 86400,
+    ),
   },
   telegram: {
     botSecret: process.env.TELEGRAM_BOT_SECRET,

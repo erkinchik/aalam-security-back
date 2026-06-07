@@ -17,7 +17,6 @@ import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { ConfirmTelegramVerificationDto } from './dto/confirm-telegram-verification.dto';
 
-const REFRESH_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 const RESET_TOKEN_EXPIRY_HOURS = 1;
 const BCRYPT_COST = 12;
 const PHONE_VERIFY_TTL_SECONDS = 10 * 60; // 10 minutes
@@ -244,7 +243,9 @@ export class AuthService implements OnModuleInit {
       expiresIn: this.configService.get<string>('jwt.refreshExpires'),
     });
 
-    await this.redis.storeRefreshToken(userId, refreshToken, REFRESH_TTL_SECONDS);
+    const refreshTtlSeconds =
+      this.configService.get<number>('jwt.refreshTtlSeconds') ?? 7 * 86400;
+    await this.redis.storeRefreshToken(userId, refreshToken, refreshTtlSeconds);
 
     return { accessToken, refreshToken };
   }
