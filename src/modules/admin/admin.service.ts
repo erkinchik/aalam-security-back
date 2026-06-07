@@ -1,6 +1,7 @@
 import {
   Injectable,
   ConflictException,
+  Logger,
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
@@ -9,6 +10,7 @@ import {
   OrgMemberRole,
   OrganizationApplicationStatus,
   OrganizationType,
+  Prisma,
   Role,
   SubscriptionRequestStatus,
 } from '@prisma/client';
@@ -29,12 +31,16 @@ import { RejectOrganizationApplicationDto } from './dto/reject-organization-appl
 import { SubscriptionRequestsQueryDto } from './dto/subscription-requests-query.dto';
 import { ApproveSubscriptionRequestDto } from './dto/approve-subscription-request.dto';
 import { RejectSubscriptionRequestDto } from './dto/reject-subscription-request.dto';
+import { CreateVenueDto } from '../venue/dto/create-venue.dto';
+import { UpdateVenueDto } from '../venue/dto/update-venue.dto';
 
 const HEARTBEAT_TTL_SECONDS = 30;
 const ONLINE_THRESHOLD_MS = (HEARTBEAT_TTL_SECONDS + 5) * 1000;
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -344,6 +350,47 @@ export class AdminService {
       select: { id: true, name: true, slug: true, type: true },
       orderBy: { name: 'asc' },
     });
+  }
+
+  async getOrganizationById(id: string) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id },
+      include: {
+        venues: {
+          select: {
+            id: true,
+            name: true,
+            address: true,
+            apartment: true,
+            floor: true,
+            entrance: true,
+            doorCode: true,
+            addressNotes: true,
+            latitude: true,
+            longitude: true,
+            inviteCode: true,
+            createdAt: true,
+          },
+          orderBy: { createdAt: 'asc' },
+        },
+        members: {
+          select: {
+            id: true,
+            role: true,
+            createdAt: true,
+            user: { select: { id: true, email: true, role: true } },
+            venue: { select: { id: true, name: true } },
+          },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    return organization;
   }
 
   private organizationNameToSlug(name: string): string {
@@ -837,5 +884,112 @@ export class AdminService {
     );
 
     return this.getSubscriptionRequestById(rejected.id);
+  }
+
+  // -------------------- Venues (admin) --------------------
+
+  async createVenue(organizationId: string, dto: CreateVenueDto) {
+    const org = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true },
+    });
+    if (!org) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    const inviteCode = await generateUniqueInviteCodeAcrossTables(this.prisma);
+
+    const venue = await this.prisma.venue.create({
+      data: {
+        organizationId,
+        name: dto.name,
+        address: dto.address ?? null,
+        apartment: dto.apartment ?? null,
+        floor: dto.floor ?? null,
+        entrance: dto.entrance ?? null,
+        doorCode: dto.doorCode ?? null,
+        addressNotes: dto.addressNotes ?? null,
+        latitude: dto.latitude ?? null,
+        longitude: dto.longitude ?? null,
+        inviteCode,
+      },
+    });
+
+    this.logger.log(
+      `Venue created by admin: venueId=${venue.id} orgId=${organizationId} name="${venue.name}"`,
+    );
+    return venue;
+  }
+
+  async updateVenue(venueId: string, dto: UpdateVenueDto) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { id: true },
+    });
+    if (!venue) {
+      throw new NotFoundException('Venue not found');
+    }
+
+    const data: Prisma.VenueUpdateInput = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.address !== undefined) data.address = dto.address;
+    if (dto.apartment !== undefined) data.apartment = dto.apartment;
+    if (dto.floor !== undefined) data.floor = dto.floor;
+    if (dto.entrance !== undefined) data.entrance = dto.entrance;
+    if (dto.doorCode !== undefined) data.doorCode = dto.doorCode;
+    if (dto.addressNotes !== undefined) data.addressNotes = dto.addressNotes;
+    if (dto.latitude !== undefined) data.latitude = dto.latitude;
+    if (dto.longitude !== undefined) data.longitude = dto.longitude;
+
+    const updated = await this.prisma.venue.update({
+      where: { id: venueId },
+      data,
+    });
+
+    this.logger.log(`Venue updated by admin: venueId=${venueId}`);
+    return updated;
+  }
+
+  async deleteVenue(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { id: true, name: true, organizationId: true },
+    });
+    if (!venue) {
+      throw new NotFoundException('Venue not found');
+    }
+
+    // EmergencySession.venueId и OrganizationMember.venueId — onDelete: SetNull
+    // в schema.prisma, поэтому исторические сессии и членства не каскадятся.
+    await this.prisma.venue.delete({ where: { id: venueId } });
+
+    this.logger.warn(
+      `Venue deleted by admin: venueId=${venueId} orgId=${venue.organizationId} name="${venue.name}"`,
+    );
+    return { status: 'ok' };
+  }
+
+  // -------------------- Organization members (admin) --------------------
+
+  async removeOrganizationMember(memberId: string) {
+    const member = await this.prisma.organizationMember.findUnique({
+      where: { id: memberId },
+      select: { id: true, role: true, userId: true, organizationId: true },
+    });
+    if (!member) {
+      throw new NotFoundException('Member not found');
+    }
+    if (member.role === OrgMemberRole.OWNER) {
+      throw new ConflictException(
+        'Нельзя убрать владельца. Сначала назначьте другого участника владельцем.',
+      );
+    }
+
+    await this.prisma.organizationMember.delete({ where: { id: memberId } });
+
+    this.logger.warn(
+      `Organization member removed by admin: memberId=${memberId} orgId=${member.organizationId} userId=${member.userId}`,
+    );
+    return { status: 'ok' };
   }
 }

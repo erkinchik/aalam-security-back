@@ -3,7 +3,9 @@ import {
   Post,
   Get,
   Body,
+  Delete,
   Param,
+  Patch,
   Query,
   UseGuards,
   HttpCode,
@@ -27,6 +29,8 @@ import { RejectOrganizationApplicationDto } from './dto/reject-organization-appl
 import { SubscriptionRequestsQueryDto } from './dto/subscription-requests-query.dto';
 import { ApproveSubscriptionRequestDto } from './dto/approve-subscription-request.dto';
 import { RejectSubscriptionRequestDto } from './dto/reject-subscription-request.dto';
+import { CreateVenueDto } from '../venue/dto/create-venue.dto';
+import { UpdateVenueDto } from '../venue/dto/update-venue.dto';
 
 @ApiTags('Admin')
 @ApiBearerAuth()
@@ -94,10 +98,47 @@ export class AdminController {
     return this.adminService.getOrganizations();
   }
 
+  @Get('organizations/:id')
+  @ApiOperation({ summary: 'Get organization details with venues + members (ADMIN only)' })
+  getOrganizationById(@Param('id') id: string) {
+    return this.adminService.getOrganizationById(id);
+  }
+
   @Post('organizations')
   @ApiOperation({ summary: 'Create organization (ADMIN only)' })
   createOrganization(@Body() dto: CreateOrganizationDto) {
     return this.adminService.createOrganization(dto);
+  }
+
+  @Post('organizations/:orgId/venues')
+  @ApiOperation({ summary: 'Create venue in an existing organization (ADMIN only)' })
+  createVenue(@Param('orgId') orgId: string, @Body() dto: CreateVenueDto) {
+    return this.adminService.createVenue(orgId, dto);
+  }
+
+  @Patch('venues/:id')
+  @ApiOperation({ summary: 'Update venue (ADMIN only)' })
+  updateVenue(@Param('id') id: string, @Body() dto: UpdateVenueDto) {
+    return this.adminService.updateVenue(id, dto);
+  }
+
+  @Delete('venues/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Delete venue (ADMIN only). Historical emergencies and members keep their rows; venueId becomes NULL via SetNull cascade.',
+  })
+  deleteVenue(@Param('id') id: string) {
+    return this.adminService.deleteVenue(id);
+  }
+
+  @Delete('organization-members/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Remove an organization member (ADMIN only). Rejects if the member is the OWNER.',
+  })
+  removeOrganizationMember(@Param('id') id: string) {
+    return this.adminService.removeOrganizationMember(id);
   }
 
   @Get('organization-applications')
