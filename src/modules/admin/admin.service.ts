@@ -375,18 +375,38 @@ export class AdminService {
     });
   }
 
-  private parseApplicationBranches(branches: unknown): Array<{ name: string; address: string }> {
+  private parseApplicationBranches(
+    branches: unknown,
+  ): Array<{ name: string; address: string; latitude: number | null; longitude: number | null }> {
     if (!Array.isArray(branches) || branches.length === 0) {
       throw new BadRequestException('Application has no valid branches');
     }
-    const out: Array<{ name: string; address: string }> = [];
+    const out: Array<{
+      name: string;
+      address: string;
+      latitude: number | null;
+      longitude: number | null;
+    }> = [];
     for (const item of branches) {
-      const row = item as { name?: unknown; address?: unknown };
+      const row = item as {
+        name?: unknown;
+        address?: unknown;
+        latitude?: unknown;
+        longitude?: unknown;
+      };
       if (typeof row?.name !== 'string' || !row.name.trim()) {
         throw new BadRequestException('Each branch must have a non-empty name');
       }
       const address = typeof row.address === 'string' ? row.address.trim() : '';
-      out.push({ name: row.name.trim(), address });
+      const latitude =
+        typeof row.latitude === 'number' && Number.isFinite(row.latitude)
+          ? row.latitude
+          : null;
+      const longitude =
+        typeof row.longitude === 'number' && Number.isFinite(row.longitude)
+          ? row.longitude
+          : null;
+      out.push({ name: row.name.trim(), address, latitude, longitude });
     }
     return out;
   }
@@ -499,6 +519,8 @@ export class AdminService {
               organizationId: org.id,
               name: br.name,
               address: br.address || null,
+              latitude: br.latitude,
+              longitude: br.longitude,
               inviteCode,
             },
           });
