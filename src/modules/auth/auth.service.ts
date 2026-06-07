@@ -103,12 +103,18 @@ export class AuthService implements OnModuleInit {
       refreshToken,
     );
     if (!isValid) {
-      // SEC-12: token is JWT-valid but missing from Redis. That means it was
-      // either already rotated (replay of an old token) or revoked. Either
-      // way, treat as compromise and burn down every session for this user.
-      await this.redis.removeAllRefreshTokens(payload.sub);
+      // JWT is signature-valid but the token is no longer in Redis. The two
+      // common causes are (a) a benign race between two browser tabs / the
+      // app and a websocket re-handshake refreshing the same token at the
+      // same time, and (b) a stolen/replayed refresh token. Previously we
+      // burned all sessions of the user here (REL-4), but on a real SOS app
+      // that meant any tab race mass-logged the user out — including from
+      // mobile during an emergency. Now we just reject this single request.
+      // Bounding the damage of (b) still stands: an attacker's window is
+      // capped by the access-token TTL (15m) once rotation hands a new pair
+      // to the legitimate client.
       this.logger.warn(
-        `Refresh-token reuse detected for user ${payload.sub}, revoked all sessions`,
+        `Refresh-token reuse rejected for user ${payload.sub} (this session must re-login; other sessions kept)`,
       );
       throw new UnauthorizedException('Token revoked');
     }
