@@ -59,7 +59,7 @@ export class EmergencyService {
         userId,
         status: { not: 'CLOSED' },
       },
-      include: { user: { select: { id: true, email: true, role: true } }, organization: true },
+      include: { user: { select: { id: true, email: true, role: true } }, organization: true, venue: true },
     });
 
     if (activeSession) {
