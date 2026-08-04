@@ -12,7 +12,6 @@ import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
-import { OrganizationService } from '../organization/organization.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { ConfirmTelegramVerificationDto } from './dto/confirm-telegram-verification.dto';
@@ -34,7 +33,6 @@ export class AuthService implements OnModuleInit {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly redis: RedisService,
-    private readonly organizationService: OrganizationService,
   ) {}
 
   async onModuleInit() {
@@ -64,7 +62,11 @@ export class AuthService implements OnModuleInit {
       },
     });
 
-    await this.organizationService.createPersonalForUser(user.id);
+    // Организацию при регистрации НЕ создаём. Раньше здесь появлялась
+    // персональная «My Account» на каждого зарегистрировавшегося, даже если он
+    // ни разу не нажимал SOS — таблица организаций замусоривалась, а из-за
+    // @@unique([userId]) эта запись ещё и занимала единственный слот членства.
+    // Личный вызов прекрасно живёт с organizationId = null.
 
     return this.generateTokens(user.id, user.role);
   }

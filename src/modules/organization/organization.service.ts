@@ -9,36 +9,6 @@ export class OrganizationService {
   constructor(private readonly prisma: PrismaService) {}
 
   /** Create a personal organization for a new user (used during registration) */
-  async createPersonalForUser(userId: string): Promise<{ id: string; slug: string }> {
-    const existingMember = await this.prisma.organizationMember.findUnique({
-      where: { userId },
-      include: { organization: true },
-    });
-    if (existingMember) {
-      return {
-        id: existingMember.organizationId,
-        slug: existingMember.organization.slug,
-      };
-    }
-
-    const slug = `personal-${userId.slice(0, 8)}`;
-    const org = await this.prisma.organization.create({
-      data: {
-        name: 'My Account',
-        type: OrganizationType.PERSONAL,
-        slug,
-        members: {
-          create: {
-            userId,
-            role: OrgMemberRole.OWNER,
-          },
-        },
-      },
-    });
-    return { id: org.id, slug: org.slug };
-  }
-
-  /** Create organization (for business signup) */
   async create(userId: string, dto: CreateOrganizationDto) {
     const alreadyMember = await this.prisma.organizationMember.findUnique({
       where: { userId },
@@ -85,16 +55,17 @@ export class OrganizationService {
   }
 
   /** Ensure user has an org (create personal if none) - for legacy compatibility */
-  async ensureUserHasOrg(userId: string): Promise<string> {
+  /**
+   * Возвращает организацию пользователя, если он в ней состоит, иначе null.
+   * Пришло на смену ensureUserHasOrg, который при отсутствии членства СОЗДАВАЛ
+   * персональную организацию — из-за этого они плодились по одной на человека.
+   */
+  async findUserOrgId(userId: string): Promise<string | null> {
     const member = await this.prisma.organizationMember.findUnique({
       where: { userId },
       select: { organizationId: true },
     });
-    if (member) {
-      return member.organizationId;
-    }
-    const { id } = await this.createPersonalForUser(userId);
-    return id;
+    return member?.organizationId ?? null;
   }
 
   /** Check user belongs to this organization (single membership per user) */

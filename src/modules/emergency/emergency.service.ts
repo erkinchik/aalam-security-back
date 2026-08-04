@@ -66,7 +66,7 @@ export class EmergencyService {
       return activeSession;
     }
 
-    let organizationId: string;
+    let organizationId: string | null;
     let sessionVenueId: string | null = null;
     let emergencyType: EmergencyType = EmergencyType.PERSONAL;
 
@@ -143,7 +143,10 @@ export class EmergencyService {
           'Activate an individual plan or bind to a venue to use SOS',
         );
       }
-      organizationId = await this.organizationService.ensureUserHasOrg(userId);
+      // Только читаем существующее членство, ничего не создаём. Просто null
+      // ставить нельзя: владелец бизнес-организации, отправляющий личный SOS
+      // без выбора объекта, должен остаться привязан к своей организации.
+      organizationId = await this.organizationService.findUserOrgId(userId);
     }
 
     const session = await this.prisma.emergencySession.create({
