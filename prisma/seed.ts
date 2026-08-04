@@ -1,4 +1,4 @@
-import { PrismaClient, OrgMemberRole, OrganizationType } from '@prisma/client';
+import { PrismaClient, OrganizationType } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { generateUniqueInviteCodeAcrossTables } from './lib/invite-code';
 
@@ -48,50 +48,28 @@ async function main() {
     process.exit(1);
   }
 
-  let defaultOrg = await prisma.organization.findUnique({ where: { slug: 'default' } });
-  if (!defaultOrg) {
-    defaultOrg = await prisma.organization.create({
-      data: { name: 'Default', type: 'PERSONAL', slug: 'default' },
-    });
-    console.log('Created Default organization');
-  }
+  // Организацию 'Default' сид больше НЕ создаёт. Это была такая же синтетика,
+  // как персональные 'My Account': запись существовала только чтобы кого-то
+  // куда-то записать. Сотрудники получают организацию по инвайт-коду,
+  // индивидуальные подписчики обходятся без неё вовсе.
 
+  // Членство в организации сид тоже не выдаёт: права админа и оператора живут
+  // в User.role, а не в OrganizationMember, поэтому вход в панель и доступ к
+  // API работают без неё. Организация появляется только по инвайт-коду.
   for (const { email, password, role, phone } of SEED_USERS) {
     const existing = await prisma.user.findUnique({ where: { email } });
     if (!existing) {
-      const user = await prisma.user.create({
+      await prisma.user.create({
         data: {
           email,
           password: await bcrypt.hash(password, 10),
           role,
           phone,
-          orgMemberships: {
-            create: {
-              organizationId: defaultOrg.id,
-              role: role === 'ADMIN' ? OrgMemberRole.OWNER : role === 'OPERATOR' ? OrgMemberRole.OPERATOR : OrgMemberRole.MEMBER,
-            },
-          },
         },
       });
       console.log(`Created ${role}: ${email}`);
     } else {
-      const membership = await prisma.organizationMember.findUnique({
-        where: { userId: existing.id },
-      });
-      if (!membership) {
-        await prisma.organizationMember.create({
-          data: {
-            userId: existing.id,
-            organizationId: defaultOrg.id,
-            role: role === 'ADMIN' ? OrgMemberRole.OWNER : role === 'OPERATOR' ? OrgMemberRole.OPERATOR : OrgMemberRole.MEMBER,
-          },
-        });
-        console.log(`Added ${email} to Default org`);
-      } else if (membership.organizationId !== defaultOrg.id) {
-        console.log(`Skip ${email}: already belongs to another organization`);
-      } else {
-        console.log(`Already exists, skipping: ${email}`);
-      }
+      console.log(`Already exists, skipping: ${email}`);
     }
   }
 
