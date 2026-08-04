@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsNumber, MaxLength } from 'class-validator';
+import { IsString, IsOptional, IsNumber, MaxLength, Min, Max } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class CreateVenueDto {
@@ -43,13 +43,21 @@ export class CreateVenueDto {
   @MaxLength(1000)
   addressNotes?: string;
 
-  @ApiProperty({ required: false })
-  @IsOptional()
-  @IsNumber()
-  latitude?: number;
+  // Координаты обязательны при СОЗДАНИИ объекта: именно по ним группа выезжает
+  // на тревогу сотрудника — приложение в этом случае вообще не запрашивает GPS
+  // телефона. Объект без координат означал бы вызов без адреса, и выяснилось бы
+  // это в худший момент. UpdateVenueDto наследуется через PartialType, поэтому
+  // при редактировании поля остаются необязательными и старые объекты без
+  // координат можно дозаполнить.
+  @ApiProperty({ example: 42.876543, description: 'Широта. Обязательна: по ней выезжает группа.' })
+  @IsNumber({}, { message: 'Укажите широту объекта: число от -90 до 90' })
+  @Min(-90, { message: 'Укажите широту объекта: число от -90 до 90' })
+  @Max(90, { message: 'Укажите широту объекта: число от -90 до 90' })
+  latitude: number;
 
-  @ApiProperty({ required: false })
-  @IsOptional()
-  @IsNumber()
-  longitude?: number;
+  @ApiProperty({ example: 74.604321, description: 'Долгота. Обязательна: по ней выезжает группа.' })
+  @IsNumber({}, { message: 'Укажите долготу объекта: число от -180 до 180' })
+  @Min(-180, { message: 'Укажите долготу объекта: число от -180 до 180' })
+  @Max(180, { message: 'Укажите долготу объекта: число от -180 до 180' })
+  longitude: number;
 }

@@ -75,9 +75,11 @@ const DEMO_ORG = {
   name: 'ЧОП «Беркут»',
   slug: 'berkut',
   inviteCode: 'BERKUT',
+  // Координаты обязательны: при вызове с объекта приложение шлёт именно их и
+  // не трогает GPS телефона. Без них демо-сценарий сотрудника не проверить.
   venues: [
-    { name: 'Офис на Чуй', address: 'пр. Чуй, 100', inviteCode: 'CHUY22' },
-    { name: 'Склад на Манаса', address: 'ул. Манаса, 40', inviteCode: 'MANAS3' },
+    { name: 'Офис на Чуй', address: 'пр. Чуй, 100', inviteCode: 'CHUY22', latitude: 42.8759, longitude: 74.6012 },
+    { name: 'Склад на Манаса', address: 'ул. Манаса, 40', inviteCode: 'MANAS3', latitude: 42.8701, longitude: 74.5893 },
   ],
 };
 
@@ -133,6 +135,8 @@ async function seedDemoOrganization() {
         organizationId: org.id,
         name: v.name,
         address: v.address,
+        latitude: v.latitude,
+        longitude: v.longitude,
         inviteCode: v.inviteCode,
       },
     });
