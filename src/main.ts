@@ -39,6 +39,15 @@ process.on('uncaughtException', (err) => {
 async function bootstrap() {
   // bufferLogs lets Nest queue early log lines until our pino logger is wired.
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
+
+  // За обратным прокси Express по умолчанию не доверяет X-Forwarded-For, и
+  // req.ip у всех запросов равен адресу прокси. Из-за этого @Throttle считал
+  // один общий лимит на всех пользователей сразу: пять входов за 15 минут на
+  // весь сервис, а не на каждого. Логи IP тоже были бесполезны.
+  // Значение 1, а не true: доверяем ровно одному хопу — нашему nginx. С true
+  // клиент смог бы подделать X-Forwarded-For и обойти лимиты.
+  app.getHttpAdapter().getInstance().set('trust proxy', 1);
+
   app.useLogger(app.get(PinoLogger));
   const configService = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
