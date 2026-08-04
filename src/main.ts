@@ -76,6 +76,10 @@ async function bootstrap() {
       whitelist: true,
       transform: true,
       forbidNonWhitelisted: true,
+      // Одна ошибка на поле. Без этого пустой телефон давал сразу три строки
+      // («Нужен номер КР…», «phone should not be empty», «phone must be a
+      // string»), и пользователь получал простыню вместо подсказки.
+      stopAtFirstError: true,
     }),
   );
 

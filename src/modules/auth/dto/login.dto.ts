@@ -6,10 +6,10 @@ import { emailToLowercaseTransform } from '../../../common/transformers/email.tr
 export class LoginDto {
   @ApiProperty({ example: 'user@example.com' })
   @Transform(emailToLowercaseTransform)
-  @IsEmail()
+  @IsEmail({}, { message: 'Некорректный email' })
   email: string;
 
   @ApiProperty({ example: '123456' })
-  @IsString()
+  @IsString({ message: 'Введите пароль' })
   password: string;
 }

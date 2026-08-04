@@ -10,7 +10,7 @@ import {
 export class RegisterDto {
   @ApiProperty({ example: 'user@example.com' })
   @Transform(emailToLowercaseTransform)
-  @IsEmail()
+  @IsEmail({}, { message: 'Некорректный email' })
   email: string;
 
   @ApiProperty({
@@ -20,16 +20,15 @@ export class RegisterDto {
       'Password must be at least 12 characters and contain a lowercase letter, an uppercase letter, and a digit.',
   })
   @IsString()
-  @MinLength(12, { message: 'Password must be at least 12 characters long' })
+  @MinLength(12, { message: 'Пароль должен быть не короче 12 символов' })
   @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$/, {
-    message:
-      'Password must contain a lowercase letter, an uppercase letter, and a digit',
+    message: 'Пароль должен содержать строчную и заглавную буквы и цифру',
   })
   password: string;
 
   @ApiProperty({ example: '+996555123456', description: 'Kyrgyzstan +996 + 9 digits' })
-  @IsString()
-  @IsNotEmpty()
+  @IsString({ message: 'Укажите номер телефона' })
+  @IsNotEmpty({ message: 'Укажите номер телефона' })
   @Matches(KYRGYZ_PHONE_REGEX, { message: KYRGYZ_PHONE_MESSAGE })
   phone: string;
 }
