@@ -20,6 +20,9 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { AdminService } from './admin.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
+import { UpdateOrganizationDto } from './dto/update-organization.dto';
+import { AddOrganizationMemberDto } from './dto/add-organization-member.dto';
+import { UpdateOrganizationMemberDto } from './dto/update-organization-member.dto';
 import { EmergenciesQueryDto } from './dto/emergencies-query.dto';
 import { AssignEmergencyDto } from './dto/assign-emergency.dto';
 import { CloseEmergencyDto } from './dto/close-emergency.dto';
@@ -108,6 +111,41 @@ export class AdminController {
   @ApiOperation({ summary: 'Create organization (ADMIN only)' })
   createOrganization(@Body() dto: CreateOrganizationDto) {
     return this.adminService.createOrganization(dto);
+  }
+
+  @Patch('organizations/:id')
+  @ApiOperation({ summary: 'Update organization name/type (ADMIN only)' })
+  updateOrganization(@Param('id') id: string, @Body() dto: UpdateOrganizationDto) {
+    return this.adminService.updateOrganization(id, dto);
+  }
+
+  @Delete('organizations/:id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Delete organization (ADMIN only). Members and venues cascade; historical ' +
+      'emergencies keep their rows with organizationId = NULL. Rejects if open sessions exist.',
+  })
+  deleteOrganization(@Param('id') id: string) {
+    return this.adminService.deleteOrganization(id);
+  }
+
+  @Post('organizations/:orgId/members')
+  @ApiOperation({
+    summary:
+      'Add an existing user to the organization (ADMIN only). Assigning OWNER ' +
+      'demotes the previous owner to MANAGER.',
+  })
+  addOrganizationMember(@Param('orgId') orgId: string, @Body() dto: AddOrganizationMemberDto) {
+    return this.adminService.addOrganizationMember(orgId, dto);
+  }
+
+  @Patch('organization-members/:id')
+  @ApiOperation({
+    summary: 'Change member role or venue binding (ADMIN only). Setting OWNER transfers ownership.',
+  })
+  updateOrganizationMember(@Param('id') id: string, @Body() dto: UpdateOrganizationMemberDto) {
+    return this.adminService.updateOrganizationMember(id, dto);
   }
 
   @Post('organizations/:orgId/venues')

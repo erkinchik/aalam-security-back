@@ -24,6 +24,9 @@ import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 const BCRYPT_COST = 12;
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
+import { UpdateOrganizationDto } from './dto/update-organization.dto';
+import { AddOrganizationMemberDto } from './dto/add-organization-member.dto';
+import { UpdateOrganizationMemberDto } from './dto/update-organization-member.dto';
 import { EmergenciesQueryDto } from './dto/emergencies-query.dto';
 import { OrganizationApplicationsQueryDto } from './dto/organization-applications-query.dto';
 import { ApproveOrganizationApplicationDto } from './dto/approve-organization-application.dto';
@@ -970,6 +973,164 @@ export class AdminService {
   }
 
   // -------------------- Organization members (admin) --------------------
+
+  async updateOrganization(id: string, dto: UpdateOrganizationDto) {
+    const org = await this.prisma.organization.findUnique({ where: { id } });
+    if (!org) throw new NotFoundException('Организация не найдена');
+
+    // Смена типа на BUSINESS требует кода приглашения: без него сотрудников
+    // не позвать, а поле уникальное — генерируем только когда его ещё нет.
+    const type = dto.type ?? org.type;
+    const needsInviteCode = type === OrganizationType.BUSINESS && !org.inviteCode;
+
+    return this.prisma.organization.update({
+      where: { id },
+      data: {
+        ...(dto.name ? { name: dto.name } : {}),
+        ...(dto.type ? { type: dto.type } : {}),
+        ...(needsInviteCode
+          ? { inviteCode: await generateUniqueInviteCodeAcrossTables(this.prisma) }
+          : {}),
+      },
+    });
+  }
+
+  async deleteOrganization(id: string) {
+    const org = await this.prisma.organization.findUnique({
+      where: { id },
+      select: { id: true, name: true, _count: { select: { members: true, venues: true } } },
+    });
+    if (!org) throw new NotFoundException('Организация не найдена');
+
+    // Незакрытая тревога важнее любой уборки: удаление оборвало бы её на ходу.
+    const openSessions = await this.prisma.emergencySession.count({
+      where: { organizationId: id, closedAt: null },
+    });
+    if (openSessions > 0) {
+      throw new ConflictException(
+        `Нельзя удалить: в организации ${openSessions} незакрытых вызовов. Закройте их сначала.`,
+      );
+    }
+
+    // Участники и объекты уходят каскадом (onDelete: Cascade), у исторических
+    // вызовов organizationId станет NULL (SetNull) — история не пропадёт.
+    await this.prisma.organization.delete({ where: { id } });
+
+    this.logger.warn(
+      `Organization deleted by admin: orgId=${id} name="${org.name}" ` +
+        `members=${org._count.members} venues=${org._count.venues}`,
+    );
+    return { id, deleted: true };
+  }
+
+  async addOrganizationMember(organizationId: string, dto: AddOrganizationMemberDto) {
+    const org = await this.prisma.organization.findUnique({ where: { id: organizationId } });
+    if (!org) throw new NotFoundException('Организация не найдена');
+
+    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    if (!user) throw new NotFoundException(`Пользователь ${dto.email} не найден`);
+
+    // OrganizationMember.@@unique([userId]) — членство одно на человека.
+    const existing = await this.prisma.organizationMember.findUnique({
+      where: { userId: user.id },
+      include: { organization: { select: { name: true } } },
+    });
+    if (existing) {
+      throw new ConflictException(
+        existing.organizationId === organizationId
+          ? `${dto.email} уже состоит в этой организации`
+          : `${dto.email} уже состоит в организации «${existing.organization.name}». Сначала уберите его оттуда.`,
+      );
+    }
+
+    await this.assertVenueBelongsToOrg(dto.venueId, organizationId);
+
+    return this.prisma.$transaction(async (tx) => {
+      // Владелец в организации один: назначая нового, прежнего переводим в
+      // менеджеры, иначе получилось бы два владельца.
+      if (dto.role === OrgMemberRole.OWNER) {
+        await this.demoteCurrentOwner(tx, organizationId);
+      }
+      return tx.organizationMember.create({
+        data: {
+          userId: user.id,
+          organizationId,
+          role: dto.role,
+          venueId: dto.venueId ?? null,
+        },
+        include: {
+          user: { select: { id: true, email: true, phone: true } },
+          venue: { select: { id: true, name: true } },
+        },
+      });
+    });
+  }
+
+  async updateOrganizationMember(memberId: string, dto: UpdateOrganizationMemberDto) {
+    const member = await this.prisma.organizationMember.findUnique({
+      where: { id: memberId },
+      include: { user: { select: { email: true } } },
+    });
+    if (!member) throw new NotFoundException('Участник не найден');
+
+    if (dto.venueId !== undefined && dto.venueId !== null) {
+      await this.assertVenueBelongsToOrg(dto.venueId, member.organizationId);
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      if (dto.role === OrgMemberRole.OWNER && member.role !== OrgMemberRole.OWNER) {
+        await this.demoteCurrentOwner(tx, member.organizationId);
+      }
+      // Организация без владельца остаётся неуправляемой — понижать
+      // единственного владельца запрещаем.
+      if (member.role === OrgMemberRole.OWNER && dto.role && dto.role !== OrgMemberRole.OWNER) {
+        throw new ConflictException(
+          'Нельзя снять роль с единственного владельца. Сначала назначьте владельцем другого участника.',
+        );
+      }
+      return tx.organizationMember.update({
+        where: { id: memberId },
+        data: {
+          ...(dto.role ? { role: dto.role } : {}),
+          ...(dto.venueId !== undefined ? { venueId: dto.venueId } : {}),
+        },
+        include: {
+          user: { select: { id: true, email: true, phone: true } },
+          venue: { select: { id: true, name: true } },
+        },
+      });
+    });
+  }
+
+  /** Объект должен принадлежать той же организации, иначе привязка бессмысленна. */
+  private async assertVenueBelongsToOrg(venueId: string | undefined, organizationId: string) {
+    if (!venueId) return;
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { organizationId: true },
+    });
+    if (!venue) throw new NotFoundException('Объект не найден');
+    if (venue.organizationId !== organizationId) {
+      throw new ConflictException('Объект принадлежит другой организации');
+    }
+  }
+
+  private async demoteCurrentOwner(
+    tx: Prisma.TransactionClient,
+    organizationId: string,
+  ): Promise<void> {
+    const current = await tx.organizationMember.findFirst({
+      where: { organizationId, role: OrgMemberRole.OWNER },
+    });
+    if (!current) return;
+    await tx.organizationMember.update({
+      where: { id: current.id },
+      data: { role: OrgMemberRole.MANAGER },
+    });
+    this.logger.warn(
+      `Ownership transferred: orgId=${organizationId} previousOwnerMemberId=${current.id} -> MANAGER`,
+    );
+  }
 
   async removeOrganizationMember(memberId: string) {
     const member = await this.prisma.organizationMember.findUnique({
