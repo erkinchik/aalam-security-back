@@ -22,6 +22,10 @@ import { PushService } from '../push/push.service';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 
 const BCRYPT_COST = 12;
+import {
+  ONLINE_THRESHOLD_MS,
+  OPEN_ASSIGNED_STATUSES,
+} from '../../common/constants/operator-presence';
 import { CreateOperatorDto } from './dto/create-operator.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
@@ -37,8 +41,6 @@ import { RejectSubscriptionRequestDto } from './dto/reject-subscription-request.
 import { CreateVenueDto } from '../venue/dto/create-venue.dto';
 import { UpdateVenueDto } from '../venue/dto/update-venue.dto';
 
-const HEARTBEAT_TTL_SECONDS = 30;
-const ONLINE_THRESHOLD_MS = (HEARTBEAT_TTL_SECONDS + 5) * 1000;
 
 @Injectable()
 export class AdminService {
@@ -302,50 +304,90 @@ export class AdminService {
     }
   }
 
-  async getOperators(organizationId?: string) {
-    const where = {
-      role: Role.OPERATOR,
-      ...(organizationId && { orgMemberships: { some: { organizationId } } }),
-    };
-
+  /**
+   * Operators are a single global pool — deliberately not scoped by
+   * organization, so any of them can be put on any session.
+   */
+  async getOperators() {
     const operators = await this.prisma.user.findMany({
-      where,
+      where: { role: Role.OPERATOR },
       select: {
         id: true,
         email: true,
-        orgMemberships: {
-          where: { role: { in: ['OWNER', 'MANAGER', 'OPERATOR'] } },
-          include: {
-            organization: { select: { id: true, name: true } },
-          },
-        },
+        onShift: true,
+        shiftStartedAt: true,
         _count: {
           select: {
             assignedSessions: {
-              where: { status: { in: ['ASSIGNED', 'IN_PROGRESS'] } },
+              where: { status: { in: OPEN_ASSIGNED_STATUSES } },
             },
           },
         },
       },
+      orderBy: [{ onShift: 'desc' }, { email: 'asc' }],
     });
 
-    const operatorsWithOnline = await Promise.all(
-      operators.map(async (op) => {
-        const heartbeat = await this.redis.getOperatorHeartbeat(op.id);
-        const lastHeartbeat = heartbeat ? parseInt(heartbeat, 10) : null;
-        const isOnline =
-          lastHeartbeat != null && Date.now() - lastHeartbeat < ONLINE_THRESHOLD_MS;
-        const { _count, ...opData } = op;
-        return {
-          ...opData,
-          isOnline,
-          lastHeartbeatAt: lastHeartbeat ? new Date(lastHeartbeat) : null,
-          activeSessionCount: _count.assignedSessions,
-        };
-      }),
+    const heartbeats = await this.redis.getOperatorHeartbeats(
+      operators.map((op) => op.id),
     );
+    const now = Date.now();
 
-    return operatorsWithOnline;
+    return operators.map((op) => {
+      const lastHeartbeat = heartbeats.get(op.id) ?? null;
+      const { _count, ...opData } = op;
+      return {
+        ...opData,
+        isOnline:
+          lastHeartbeat != null && now - lastHeartbeat < ONLINE_THRESHOLD_MS,
+        lastHeartbeatAt: lastHeartbeat ? new Date(lastHeartbeat) : null,
+        activeSessionCount: _count.assignedSessions,
+      };
+    });
+  }
+
+  /**
+   * Admin override of an operator's shift. Ending it obeys the same rule the
+   * operator faces: open sessions must be dealt with first, otherwise they'd
+   * be stranded on someone who no longer receives anything.
+   */
+  async setOperatorShift(operatorId: string, onShift: boolean) {
+    const operator = await this.prisma.user.findUnique({
+      where: { id: operatorId },
+      select: { role: true },
+    });
+    if (!operator || operator.role !== Role.OPERATOR) {
+      throw new BadRequestException('User is not an operator');
+    }
+
+    if (!onShift) {
+      const activeSessionCount = await this.prisma.emergencySession.count({
+        where: {
+          assignedOperatorId: operatorId,
+          status: { in: OPEN_ASSIGNED_STATUSES },
+        },
+      });
+      if (activeSessionCount > 0) {
+        throw new ConflictException(
+          `У оператора ${activeSessionCount} незакрытых вызовов. ` +
+            'Переназначьте или закройте их перед снятием со смены.',
+        );
+      }
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id: operatorId },
+      data: {
+        onShift,
+        shiftStartedAt: onShift ? new Date() : null,
+      },
+      select: { id: true, email: true, onShift: true, shiftStartedAt: true },
+    });
+    await this.wsGateway.setOperatorShiftRoom(operatorId, onShift);
+
+    this.logger.log(
+      `Admin set operator ${operatorId} shift to ${onShift ? 'ON' : 'OFF'}`,
+    );
+    return updated;
   }
 
   async getOrganizations() {

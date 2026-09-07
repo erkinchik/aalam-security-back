@@ -19,6 +19,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AdminService } from './admin.service';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { SetOperatorShiftDto } from './dto/set-operator-shift.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { AddOrganizationMemberDto } from './dto/add-organization-member.dto';
@@ -90,9 +91,24 @@ export class AdminController {
   }
 
   @Get('operators')
-  @ApiOperation({ summary: 'List operators with workload and online status (ADMIN only)' })
-  getOperators(@Query('organizationId') organizationId?: string) {
-    return this.adminService.getOperators(organizationId);
+  @ApiOperation({
+    summary: 'List operators with shift, workload and online status (ADMIN only)',
+  })
+  getOperators() {
+    return this.adminService.getOperators();
+  }
+
+  @Post('operators/:id/shift')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Put an operator on/off shift (409 when taking off with open sessions)',
+  })
+  setOperatorShift(
+    @Param('id') id: string,
+    @Body() dto: SetOperatorShiftDto,
+  ) {
+    return this.adminService.setOperatorShift(id, dto.onShift);
   }
 
   @Get('organizations')
