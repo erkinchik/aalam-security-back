@@ -47,9 +47,10 @@ export class AuthController {
     return this.authService.register(dto);
   }
 
-  // SEC-6: 5 attempts per 15 min, keyed by IP+email (via LoginThrottlerGuard).
+  // SEC-6: 5 attempts per 15 min per (IP, email) — enforced inside
+  // LoginThrottlerGuard. Deliberately no @Throttle here: it would apply to the
+  // global IP-keyed guard too and cap the whole IP at 5 sign-ins per 15 min.
   @UseGuards(LoginThrottlerGuard)
-  @Throttle({ default: { limit: 5, ttl: 900_000 } })
   @Post('login')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Login with email and password' })
