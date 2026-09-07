@@ -246,10 +246,17 @@ export class AuthService implements OnModuleInit {
       expiresIn: this.configService.get<string>('jwt.accessExpires'),
     });
 
-    const refreshToken = this.jwtService.sign(payload, {
-      secret: this.configService.get<string>('jwt.refreshSecret'),
-      expiresIn: this.configService.get<string>('jwt.refreshExpires'),
-    });
+    // `jti` makes every refresh token unique. Without it the payload is just
+    // {sub, role, iat, exp}, so two rotations inside the same second produced a
+    // byte-identical JWT: the "old" token stayed in Redis under the same key
+    // and reuse detection silently did nothing.
+    const refreshToken = this.jwtService.sign(
+      { ...payload, jti: crypto.randomUUID() },
+      {
+        secret: this.configService.get<string>('jwt.refreshSecret'),
+        expiresIn: this.configService.get<string>('jwt.refreshExpires'),
+      },
+    );
 
     const refreshTtlSeconds =
       this.configService.get<number>('jwt.refreshTtlSeconds') ?? 7 * 86400;
