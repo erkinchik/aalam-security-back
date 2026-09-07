@@ -10,7 +10,8 @@
     "start:prod": "node dist/src/main.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
-    "prisma:migrate:dev": "prisma migrate dev"
+    "prisma:migrate:dev": "prisma migrate dev",
+    "test:e2e": "node --test --test-reporter=spec test/e2e.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.0",
