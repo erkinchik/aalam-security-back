@@ -45,26 +45,31 @@ export class PushService {
     );
   }
 
-  async sendSosAlert(sessionId: string, organizationId: string) {
-    const operators = await this.prisma.organizationMember.findMany({
-      where: {
-        organizationId,
-        role: { in: ['OWNER', 'MANAGER', 'OPERATOR'] },
-        user: { role: 'OPERATOR', pushToken: { not: null } },
-      },
-      include: { user: { select: { pushToken: true } } },
+  /**
+   * Broadcast a fresh SOS to every operator on shift. Operators are a global
+   * pool — they are deliberately not scoped to the raising organization.
+   */
+  async sendSosAlert(sessionId: string) {
+    const operators = await this.prisma.user.findMany({
+      where: { role: 'OPERATOR', onShift: true, pushToken: { not: null } },
+      select: { pushToken: true },
     });
 
     const tokens = operators
-      .map((o) => o.user.pushToken)
+      .map((o) => o.pushToken)
       .filter((t): t is string => !!t);
-    if (tokens.length === 0) return;
+    if (tokens.length === 0) {
+      this.logger.warn(
+        `SOS ${sessionId} raised with no operator on shift to alert`,
+      );
+      return;
+    }
 
     const messages = tokens.map((token) => ({
       to: token,
       sound: 'default',
-      title: '🚨 SOS Emergency',
-      body: 'New emergency alert. Open the app to respond.',
+      title: '🚨 Новый SOS',
+      body: 'Поступил вызов. Откройте приложение, чтобы принять.',
       data: { sessionId, type: 'emergency:new' },
       channelId: 'sos-emergency',
       priority: 'high',

@@ -9,6 +9,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { OrganizationService } from '../organization/organization.service';
+import { PushService } from '../push/push.service';
 import { CreateLocationDto } from './dto/create-location.dto';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 
@@ -23,6 +24,7 @@ export class EmergencyService {
     private readonly redis: RedisService,
     private readonly wsGateway: WebsocketGateway,
     private readonly organizationService: OrganizationService,
+    private readonly pushService: PushService,
   ) {}
 
   async startSession(userId: string, venueId?: string) {
@@ -165,6 +167,8 @@ export class EmergencyService {
 
     await this.redis.addActiveEmergency(session.id);
     this.wsGateway.emitEmergencyNew(session as unknown as Record<string, unknown>);
+    // Fire-and-forget: a slow Expo call must never delay the SOS response.
+    void this.pushService.sendSosAlert(session.id);
 
     return session;
   }

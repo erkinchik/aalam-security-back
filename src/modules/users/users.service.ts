@@ -181,11 +181,4 @@ export class UsersService {
     return { status: 'ok' };
   }
 
-  async getOperatorPushTokens(): Promise<string[]> {
-    const operators = await this.prisma.user.findMany({
-      where: { role: 'OPERATOR', pushToken: { not: null } },
-      select: { pushToken: true },
-    });
-    return operators.map((o) => o.pushToken!).filter(Boolean);
-  }
 }
