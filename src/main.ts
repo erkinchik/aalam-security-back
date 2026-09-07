@@ -33,6 +33,10 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
   processLogger.error('Uncaught exception, exiting', err.stack);
+  // pino's pretty transport runs in a worker thread and process.exit() drops
+  // whatever it still had buffered, so the reason for the exit is repeated on
+  // stderr synchronously — otherwise the container dies with no output.
+  console.error('[Process] Uncaught exception, exiting:', err);
   process.exit(1);
 });
 
@@ -123,4 +127,14 @@ async function bootstrap() {
   logger.log(`CORS origins: ${allowedOrigins.join(', ') || '(none — locked down)'}`);
 }
 
-void bootstrap();
+// A failed bootstrap (port already taken, bad DATABASE_URL, invalid env) used
+// to land in the unhandledRejection handler, which only logs — leaving a live
+// process that listens to nothing. Startup failure is fatal: exit non-zero so
+// the supervisor restarts instead of holding a dead container.
+bootstrap().catch((err) => {
+  // console.error, not the Nest logger: the pino transport is a worker thread
+  // and process.exit() truncates its buffer, so a failed start produced an
+  // exit code with completely empty logs.
+  console.error('[Bootstrap] Failed to start application:', err);
+  process.exit(1);
+});
