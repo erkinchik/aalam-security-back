@@ -298,6 +298,11 @@ export class EmergencyService {
         include: {
           locations: { orderBy: { createdAt: 'desc' as const }, take: 1 },
           assignedOperator: { select: { id: true, email: true } },
+          // venue и organization — чтобы форма ответа совпадала с /emergency/start.
+          // Раньше история отдавала сессию без объекта, и любой, кто принимал
+          // её за полноценную, терял координаты поста.
+          venue: true,
+          organization: { select: { id: true, name: true } },
         },
         orderBy: { createdAt: 'desc' },
         skip,
