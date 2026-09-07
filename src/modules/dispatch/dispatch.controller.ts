@@ -67,4 +67,48 @@ export class DispatchController {
   heartbeat(@CurrentUser() user: { id: string }) {
     return this.dispatchService.heartbeat(user.id);
   }
+
+  @Get('shift')
+  @ApiOperation({ summary: 'Current shift state of the operator' })
+  getShift(@CurrentUser() user: { id: string }) {
+    return this.dispatchService.getShift(user.id);
+  }
+
+  @Post('shift/start')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Go on shift — start receiving new SOS alerts' })
+  startShift(@CurrentUser() user: { id: string }) {
+    return this.dispatchService.startShift(user.id);
+  }
+
+  @Post('shift/end')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'End shift (409 while the operator still has open sessions)',
+  })
+  endShift(@CurrentUser() user: { id: string }) {
+    return this.dispatchService.endShift(user.id);
+  }
+
+  @Get('pool')
+  @ApiOperation({
+    summary: 'Unclaimed SOS sessions (empty when the operator is off shift)',
+  })
+  pool(
+    @CurrentUser() user: { id: string },
+    @Query() query: PaginationQueryDto,
+  ) {
+    return this.dispatchService.getPool(
+      user.id,
+      query.page ?? 1,
+      query.limit ?? 20,
+    );
+  }
+
+  @Post(':id/accept')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Claim an unassigned session — first caller wins' })
+  accept(@Param('id') id: string, @CurrentUser() user: { id: string }) {
+    return this.dispatchService.acceptSession(id, user.id);
+  }
 }

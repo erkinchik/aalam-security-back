@@ -65,6 +65,9 @@ model User {
   individualSubscriptionActive Boolean   @default(false)
   subscriptionExpiresAt DateTime?
   planId           String?
+  /// OPERATOR only: on shift means new SOS sessions are broadcast to this user.
+  onShift          Boolean               @default(false)
+  shiftStartedAt   DateTime?
   deletedAt        DateTime?
   createdAt        DateTime              @default(now())
   emergencies      EmergencySession[]
@@ -74,6 +77,9 @@ model User {
   passwordResetTokens PasswordResetToken[]
   organizationApplications OrganizationApplication[]
   subscriptionRequests SubscriptionRequest[]
+
+  @@index([role, onShift])
+  @@index([deletedAt])
 }
 
 model Organization {
@@ -153,6 +159,7 @@ model EmergencySession {
   @@index([status])
   @@index([createdAt])
   @@index([organizationId])
+  @@index([assignedOperatorId])
 }
 
 model EmergencyLocation {

@@ -7,8 +7,16 @@ import {
 import { Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { EmergencyStatus } from '@prisma/client';
 import { Server, Socket } from 'socket.io';
 import { PrismaService } from '../../prisma/prisma.service';
+import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
+
+/** Operators on shift — the only ones alerted about a fresh SOS. */
+export const ON_SHIFT_ROOM = 'on_shift_operators';
+
+/** Per-operator room, so shift endpoints can move sockets without tracking them. */
+export const operatorRoom = (operatorId: string) => `operator_${operatorId}`;
 
 // Origin-check function read at decorator-eval time. Re-reads process.env on
 // each request so an env reload doesn't require a rebuild. Allows requests
@@ -69,7 +77,11 @@ export class WebsocketGateway
         void this.sendAdminBootstrap(client);
       } else if (payload.role === 'OPERATOR') {
         client.join('operators');
+        // Personal room lets the HTTP shift endpoints move this operator in and
+        // out of ON_SHIFT_ROOM without tracking sockets by hand.
+        client.join(operatorRoom(payload.sub));
         this.logger.log(`Operator ${payload.sub} connected`);
+        void this.sendOperatorBootstrap(client, payload.sub);
       } else {
         client.join(`user_${payload.sub}`);
         this.logger.log(`User ${payload.sub} connected`);
@@ -97,6 +109,61 @@ export class WebsocketGateway
     }
   }
 
+  /**
+   * REL-6 for operators: an operator who reconnects mid-shift would otherwise
+   * miss every `emergency:new` emitted while the socket was down. Replays the
+   * unclaimed pool plus the sessions already assigned to them.
+   */
+  private async sendOperatorBootstrap(client: Socket, operatorId: string) {
+    try {
+      const operator = await this.prisma.user.findUnique({
+        where: { id: operatorId },
+        select: { onShift: true },
+      });
+      if (operator?.onShift) {
+        client.join(ON_SHIFT_ROOM);
+      }
+
+      const sessions = await this.prisma.emergencySession.findMany({
+        where: {
+          OR: [
+            ...(operator?.onShift
+              ? [{ status: EmergencyStatus.NEW, assignedOperatorId: null }]
+              : []),
+            {
+              assignedOperatorId: operatorId,
+              status: {
+                in: [EmergencyStatus.ASSIGNED, EmergencyStatus.IN_PROGRESS],
+              },
+            },
+          ],
+        },
+        include: OPERATOR_SESSION_INCLUDE,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      });
+      client.emit('emergency:bootstrap', { sessions });
+    } catch (err) {
+      this.logger.error(
+        'Failed to send operator bootstrap snapshot',
+        err as Error,
+      );
+    }
+  }
+
+  /**
+   * Moves every socket of this operator in or out of the on-shift broadcast
+   * room. Called by the shift endpoints, which have no socket reference.
+   */
+  async setOperatorShiftRoom(operatorId: string, onShift: boolean) {
+    const room = this.server.in(operatorRoom(operatorId));
+    if (onShift) {
+      await room.socketsJoin(ON_SHIFT_ROOM);
+    } else {
+      await room.socketsLeave(ON_SHIFT_ROOM);
+    }
+  }
+
   handleDisconnect(client: Socket) {
     const user = client.data?.user;
     if (user) {
@@ -105,7 +172,9 @@ export class WebsocketGateway
   }
 
   emitEmergencyNew(session: Record<string, unknown>) {
-    this.server.to('admin_room').emit('emergency:new', session);
+    // Only operators currently on shift are alerted; everyone else sees the
+    // session through the regular status events.
+    this.server.to(['admin_room', ON_SHIFT_ROOM]).emit('emergency:new', session);
   }
 
   emitLocationUpdate(

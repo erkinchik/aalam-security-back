@@ -1,6 +1,7 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import { HEARTBEAT_TTL_SECONDS } from '../common/constants/operator-presence';
 
 @Injectable()
 export class RedisService implements OnModuleDestroy {
@@ -32,12 +33,34 @@ export class RedisService implements OnModuleDestroy {
       `operator:${operatorId}:heartbeat`,
       Date.now().toString(),
       'EX',
-      30,
+      HEARTBEAT_TTL_SECONDS,
     );
   }
 
   async getOperatorHeartbeat(operatorId: string): Promise<string | null> {
     return this.client.get(`operator:${operatorId}:heartbeat`);
+  }
+
+  /**
+   * Batch variant of getOperatorHeartbeat — one round-trip for a whole list of
+   * operators instead of a GET per operator.
+   */
+  async getOperatorHeartbeats(
+    operatorIds: string[],
+  ): Promise<Map<string, number>> {
+    const result = new Map<string, number>();
+    if (operatorIds.length === 0) return result;
+
+    const values = await this.client.mget(
+      operatorIds.map((id) => `operator:${id}:heartbeat`),
+    );
+    operatorIds.forEach((id, i) => {
+      const raw = values[i];
+      if (!raw) return;
+      const ts = parseInt(raw, 10);
+      if (!Number.isNaN(ts)) result.set(id, ts);
+    });
+    return result;
   }
 
   async storeRefreshToken(
