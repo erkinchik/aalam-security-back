@@ -1,5 +1,6 @@
 import {
   Injectable,
+  ConflictException,
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
@@ -59,6 +60,22 @@ export class VenueService {
 
   async bindByInviteCode(userId: string, inviteCode: string) {
     const code = inviteCode.trim().toUpperCase();
+
+    // Привязка ниже безусловно удаляет прежнее членство (одно на пользователя),
+    // и для владельца это означало бы, что организация молча остаётся без
+    // ответственного: сотрудники в ней есть, управлять ей некому.
+    // Админ-панель такое запрещает — «Нельзя убрать владельца», — а этот путь
+    // обходил обе проверки. Закрываем и его.
+    const current = await this.prisma.organizationMember.findUnique({
+      where: { userId },
+      include: { organization: { select: { name: true } } },
+    });
+    if (current?.role === OrgMemberRole.OWNER) {
+      throw new ConflictException(
+        `Вы владелец организации «${current.organization.name}». ` +
+          'Сначала передайте владение другому участнику — иначе она останется без ответственного.',
+      );
+    }
 
     const org = await this.prisma.organization.findFirst({
       where: {
