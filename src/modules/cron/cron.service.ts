@@ -1,9 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { Role } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
+import {
+  ONLINE_THRESHOLD_MS,
+  SHIFT_ALIVE_THRESHOLD_MS,
+  isHeartbeatFresh,
+} from '../../common/constants/operator-presence';
 
 const STALE_LOCK_KEY = 'cron:stale-assignments';
 // Lock TTL just longer than the schedule (30s) so a hanging worker doesn't
@@ -48,7 +54,9 @@ export class CronService {
           const heartbeat = await this.redis.getOperatorHeartbeat(
             session.assignedOperatorId!,
           );
-          if (heartbeat) continue;
+          // The heartbeat key outlives the online window (it also backs the
+          // shift check), so compare the timestamp rather than mere existence.
+          if (isHeartbeatFresh(heartbeat, ONLINE_THRESHOLD_MS)) continue;
 
           this.logger.warn(
             `Operator ${session.assignedOperatorId} offline. Reassigning session ${session.id}`,
@@ -92,7 +100,50 @@ export class CronService {
         error as Error,
       );
     } finally {
+      // Sessions are freed first: dropping the shift of an operator who still
+      // held calls would leave those calls stranded.
+      await this.dropDeadShifts();
       await this.redis.getClient().del(STALE_LOCK_KEY);
+    }
+  }
+
+  /**
+   * An operator whose device died stays flagged on-shift forever, keeps
+   * receiving SOS broadcasts nobody reads, and pollutes the admin roster.
+   * Silence longer than SHIFT_ALIVE_THRESHOLD_MS ends the shift for them.
+   */
+  private async dropDeadShifts() {
+    try {
+      const onShift = await this.prisma.user.findMany({
+        where: { role: Role.OPERATOR, onShift: true },
+        select: { id: true },
+      });
+      if (onShift.length === 0) return;
+
+      const heartbeats = await this.redis.getOperatorHeartbeats(
+        onShift.map((o) => o.id),
+      );
+      const now = Date.now();
+      const dead = onShift
+        .map((o) => o.id)
+        .filter((id) => {
+          const ts = heartbeats.get(id);
+          return ts == null || now - ts >= SHIFT_ALIVE_THRESHOLD_MS;
+        });
+      if (dead.length === 0) return;
+
+      await this.prisma.user.updateMany({
+        where: { id: { in: dead } },
+        data: { onShift: false, shiftStartedAt: null },
+      });
+      await Promise.all(
+        dead.map((id) => this.wsGateway.setOperatorShiftRoom(id, false)),
+      );
+      this.logger.warn(
+        `Ended shift for ${dead.length} unreachable operator(s): ${dead.join(', ')}`,
+      );
+    } catch (error) {
+      this.logger.error('Failed to drop dead operator shifts', error as Error);
     }
   }
 }
