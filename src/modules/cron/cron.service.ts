@@ -7,6 +7,7 @@ import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { RefreshTokenService } from '../refresh-token/refresh-token.service';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 import {
+  OPEN_ASSIGNED_STATUSES,
   RECLAIM_ASSIGNMENT_THRESHOLD_MS,
   SHIFT_ALIVE_THRESHOLD_MS,
   isHeartbeatFresh,
@@ -52,9 +53,11 @@ export class CronService {
       // продолжая при этом видеть интерфейс дежурного.
       await this.refreshPresenceFromSockets();
 
+      // Только ASSIGNED: вызов «В работе» оператор ведёт из навигатора или
+      // звонка, где пульс замолкает, — его не отбираем (см. operator-presence).
       const staleSessions = await this.prisma.emergencySession.findMany({
         where: {
-          status: { in: ['ASSIGNED', 'IN_PROGRESS'] },
+          status: 'ASSIGNED',
           assignedOperatorId: { not: null },
         },
         select: { id: true, assignedOperatorId: true },
@@ -83,7 +86,7 @@ export class CronService {
             const updated = await this.prisma.emergencySession.update({
               where: {
                 id: session.id,
-                status: { in: ['ASSIGNED', 'IN_PROGRESS'] },
+                status: 'ASSIGNED',
                 assignedOperatorId: session.assignedOperatorId,
               },
               data: {
@@ -147,8 +150,14 @@ export class CronService {
    */
   private async dropDeadShifts() {
     try {
+      // С открытым вызовом смену не снимаем: ASSIGNED к этому моменту уже
+      // вернулись в пул, а IN_PROGRESS остаётся за оператором и в пути.
       const onShift = await this.prisma.user.findMany({
-        where: { role: Role.OPERATOR, onShift: true },
+        where: {
+          role: Role.OPERATOR,
+          onShift: true,
+          assignedSessions: { none: { status: { in: OPEN_ASSIGNED_STATUSES } } },
+        },
         select: { id: true },
       });
       if (onShift.length === 0) return;
@@ -165,8 +174,13 @@ export class CronService {
         });
       if (dead.length === 0) return;
 
+      // Условие повторено в самой записи: вызов мог появиться у оператора
+      // между выборкой и обновлением.
       await this.prisma.user.updateMany({
-        where: { id: { in: dead } },
+        where: {
+          id: { in: dead },
+          assignedSessions: { none: { status: { in: OPEN_ASSIGNED_STATUSES } } },
+        },
         data: { onShift: false, shiftStartedAt: null },
       });
       await Promise.all(

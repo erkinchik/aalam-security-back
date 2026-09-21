@@ -1297,3 +1297,41 @@ test(
     });
   },
 );
+
+test(
+  'cron не отбирает вызов «В работе» и не снимает смену с оператора в пути',
+  { skip: SLOW ? false : 'нужен E2E_SLOW=1 (тест длится ~3.5 минуты)' },
+  async () => {
+    await setShift(OPS.b, true);
+    const u = await makeSubscribedUser('cronprog');
+    const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+    const id = s.data.id;
+    assertOk(await api('POST', `/dispatch/${id}/accept`, { token: OPS.b.token }), 'accept');
+    assertOk(
+      await api('POST', `/dispatch/${id}/start-progress`, { token: OPS.b.token }),
+      'start-progress',
+    );
+
+    // Оператор ушёл в навигатор: приложение в фоне, пульса нет.
+    pausedOps.add(OPS.b.email);
+    // Дольше порога смены (180 с) плюс тик cron (30 с).
+    await sleep(215_000);
+
+    const detail = await api('GET', `/admin/emergencies/${id}`, { token: T.admin });
+    assert.equal(detail.data.status, 'IN_PROGRESS', 'вызов «В работе» не отбирается по тишине');
+    assert.equal(detail.data.assignedOperatorId, OPS.b.id);
+    const ops = await api('GET', '/admin/operators?limit=100', { token: T.admin });
+    assert.equal(
+      ops.data.data.find((o) => o.id === OPS.b.id)?.onShift,
+      true,
+      'смена оператора с вызовом в работе не снимается',
+    );
+
+    pausedOps.delete(OPS.b.email);
+    await api('POST', `/dispatch/${id}/resolve`, {
+      token: OPS.b.token,
+      body: { resolution: 'cron in-progress cleanup' },
+    });
+    await setShift(OPS.b, false);
+  },
+);
