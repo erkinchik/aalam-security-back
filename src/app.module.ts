@@ -11,6 +11,8 @@ import { MetricsTokenMiddleware } from './common/middleware/metrics-token.middle
 import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { MailModule } from './modules/mail/mail.module';
+import { RefreshTokenModule } from './modules/refresh-token/refresh-token.module';
 import { UsersModule } from './modules/users/users.module';
 import { EmergencyModule } from './modules/emergency/emergency.module';
 import { DispatchModule } from './modules/dispatch/dispatch.module';
@@ -77,6 +79,8 @@ import { SubscriptionRequestModule } from './modules/subscription-request/subscr
     ThrottlerModule.forRoot([{ ttl: 60000, limit: 60 }]),
     PrismaModule,
     RedisModule,
+    MailModule,
+    RefreshTokenModule,
     AuthModule,
     UsersModule,
     OrganizationModule,

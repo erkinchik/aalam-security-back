@@ -1,8 +1,8 @@
 import {
   Injectable,
-  ConflictException,
   UnauthorizedException,
   BadRequestException,
+  HttpStatus,
   Logger,
   OnModuleInit,
 } from '@nestjs/common';
@@ -12,9 +12,17 @@ import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
+import { MailService } from '../mail/mail.service';
+import { RefreshTokenService } from '../refresh-token/refresh-token.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { ConfirmTelegramVerificationDto } from './dto/confirm-telegram-verification.dto';
+import { ErrorCode } from '../../common/errors/error-codes';
+import {
+  AppException,
+  badRequest,
+  conflict,
+} from '../../common/errors/app.exception';
 
 const RESET_TOKEN_EXPIRY_HOURS = 1;
 const BCRYPT_COST = 12;
@@ -33,6 +41,8 @@ export class AuthService implements OnModuleInit {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly redis: RedisService,
+    private readonly mail: MailService,
+    private readonly refreshTokens: RefreshTokenService,
   ) {}
 
   async onModuleInit() {
@@ -48,7 +58,10 @@ export class AuthService implements OnModuleInit {
     });
 
     if (existing) {
-      throw new ConflictException('Email already registered');
+      throw conflict(
+        ErrorCode.EMAIL_ALREADY_REGISTERED,
+        'Email already registered',
+      );
     }
 
     const hashedPassword = await bcrypt.hash(dto.password, BCRYPT_COST);
@@ -84,7 +97,11 @@ export class AuthService implements OnModuleInit {
     if (!user || !passwordValid || user.deletedAt) {
       // Deleted users are rejected with the same error to avoid leaking that
       // a previously-existing account was deleted.
-      throw new UnauthorizedException('Invalid credentials');
+      throw new AppException(
+        ErrorCode.INVALID_CREDENTIALS,
+        HttpStatus.UNAUTHORIZED,
+        'Invalid credentials',
+      );
     }
 
     return this.generateTokens(user.id, user.role);
@@ -100,10 +117,7 @@ export class AuthService implements OnModuleInit {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    const isValid = await this.redis.isRefreshTokenValid(
-      payload.sub,
-      refreshToken,
-    );
+    const isValid = await this.refreshTokens.isValid(payload.sub, refreshToken);
     if (!isValid) {
       // JWT is signature-valid but the token is no longer in Redis. The two
       // common causes are (a) a benign race between two browser tabs / the
@@ -128,35 +142,68 @@ export class AuthService implements OnModuleInit {
       throw new UnauthorizedException('User not found');
     }
 
-    await this.redis.removeRefreshToken(payload.sub, refreshToken);
+    await this.refreshTokens.remove(refreshToken);
 
     return this.generateTokens(user.id, user.role);
   }
 
   async logout(userId: string, refreshToken: string) {
-    await this.redis.removeRefreshToken(userId, refreshToken);
+    await this.refreshTokens.remove(refreshToken);
+    // Иначе вышедший (или уволенный) оператор продолжал бы получать «Новый SOS»
+    // на свой телефон до следующего входа кого-то другого.
+    await this.prisma.user.updateMany({
+      where: { id: userId, pushToken: { not: null } },
+      data: { pushToken: null },
+    });
     return { status: 'ok' };
   }
 
+  /**
+   * Восстановление пароля по почте.
+   *
+   * Если SMTP не настроен, отвечаем прямо — обещать письмо, которое некому
+   * отправить, хуже, чем сказать «недоступно». Когда настроен, ответ одинаков
+   * для существующего и несуществующего адреса, так что перебор почт ничего не
+   * даёт.
+   */
   async forgotPassword(email: string) {
+    if (!this.mail.isEnabled() || !this.configService.get<string>('app.url')) {
+      this.logger.warn(
+        'Password reset requested, but SMTP or APP_URL is not configured',
+      );
+      throw new AppException(
+        ErrorCode.PASSWORD_RESET_UNAVAILABLE,
+        HttpStatus.SERVICE_UNAVAILABLE,
+        'Password reset by email is not available: mail is not configured',
+      );
+    }
+
     const user = await this.prisma.user.findUnique({ where: { email } });
-    if (!user || user.deletedAt) return { status: 'ok' }; // Don't reveal if email exists / was deleted
+    // Не раскрываем, есть ли такой адрес и не удалён ли он.
+    if (!user || user.deletedAt) return { status: 'ok' };
 
     const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + RESET_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
+    const expiresAt = new Date(
+      Date.now() + RESET_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000,
+    );
     await this.prisma.passwordResetToken.create({
       data: { userId: user.id, token, expiresAt },
     });
 
-    const appUrl = this.configService.get<string>('app.url') || 'https://app.sos-security.com';
+    const appUrl = this.configService.get<string>('app.url');
     const resetLink = `${appUrl}/reset-password?token=${token}`;
-    // TODO (FEAT-1): integrate SendGrid/Postmark/Mailgun.
-    // SEC-11: never log the full token. Print only a short prefix for audit.
+    // SEC-11: в лог только префикс, никогда не весь токен.
     this.logger.log(
-      `Password reset requested for ${email} (token prefix: ${token.slice(0, 6)}…)`,
+      `Password reset requested (token prefix: ${token.slice(0, 6)}…)`,
     );
-    // resetLink kept as a local — used by future mailer.
-    void resetLink;
+
+    await this.mail.send(
+      email,
+      'Восстановление пароля — SOS Security',
+      `Чтобы задать новый пароль, откройте ссылку:\n\n${resetLink}\n\n` +
+        `Ссылка действует ${RESET_TOKEN_EXPIRY_HOURS} ч. ` +
+        'Если вы не запрашивали восстановление, просто игнорируйте это письмо.',
+    );
 
     return { status: 'ok' };
   }
@@ -210,7 +257,7 @@ export class AuthService implements OnModuleInit {
     }
 
     if (user.phone && user.phone !== dto.phone) {
-      throw new BadRequestException('Phone mismatch');
+      throw badRequest(ErrorCode.PHONE_MISMATCH, 'Phone mismatch');
     }
 
     // If telegramId already belongs to another account, refuse — one Telegram
@@ -219,7 +266,10 @@ export class AuthService implements OnModuleInit {
       where: { telegramId: dto.telegramId },
     });
     if (existingTelegramUser && existingTelegramUser.id !== userId) {
-      throw new BadRequestException('Telegram account already linked');
+      throw badRequest(
+        ErrorCode.TELEGRAM_ALREADY_LINKED,
+        'Telegram account already linked',
+      );
     }
 
     await this.prisma.user.update({
@@ -260,7 +310,7 @@ export class AuthService implements OnModuleInit {
 
     const refreshTtlSeconds =
       this.configService.get<number>('jwt.refreshTtlSeconds') ?? 7 * 86400;
-    await this.redis.storeRefreshToken(userId, refreshToken, refreshTtlSeconds);
+    await this.refreshTokens.store(userId, refreshToken, refreshTtlSeconds);
 
     return { accessToken, refreshToken };
   }

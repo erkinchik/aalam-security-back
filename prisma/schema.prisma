@@ -73,6 +73,7 @@ model User {
   orgMemberships   OrganizationMember[]
   emergencyContacts EmergencyContact[]
   passwordResetTokens PasswordResetToken[]
+  refreshTokens    RefreshToken[]
   organizationApplications OrganizationApplication[]
   subscriptionRequests SubscriptionRequest[]
 
@@ -182,6 +183,21 @@ model EmergencyContact {
   createdAt DateTime @default(now())
 
   @@index([userId])
+}
+
+/// Refresh-токены жили только в Redis, из-за чего при его недоступности нельзя
+/// было ни войти, ни обновить сессию. Хранится отпечаток, а не сам токен: в базе
+/// не должно лежать ничего, чем можно войти.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model PasswordResetToken {
