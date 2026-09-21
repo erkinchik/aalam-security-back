@@ -432,7 +432,7 @@ test('оператор вне смены не может принять вызо
   const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
   const r = await api('POST', `/dispatch/${s.data.id}/accept`, { token: OPS.b.token });
   assert.equal(r.status, 403, `${r.status} ${msgOf(r.data)}`);
-  assert.match(msgOf(r.data), /смену/i);
+  assert.equal(r.data.code, 'NOT_ON_SHIFT');
 });
 
 /* ======================= 7. Гонка «кто первый принял» ======================= */
@@ -466,7 +466,7 @@ test('два оператора принимают одновременно: р�
     const loser = ra.status === 200 ? rb : ra;
     assert.equal(winner.data.status, 'ASSIGNED');
     assert.ok(winner.data.assignedOperatorId, 'победитель должен быть назначен');
-    assert.match(msgOf(loser.data), /принят другим/i);
+    assert.equal(loser.data.code, 'SESSION_ALREADY_CLAIMED');
 
     // Убираем за собой, иначе оператор не сможет сдать смену.
     const winnerToken =
@@ -551,6 +551,113 @@ test('resolve без текста резолюции — 400', async () => {
   });
 });
 
+/* ======================= 8b. Занятый оператор не получает новых вызовов ======================= */
+
+test('занятому оператору пул пуст, а другому свободному — нет', async () => {
+  const busy = await makeSubscribedUser('busy1');
+  const taken = await api('POST', '/emergency/start', { token: busy.token, body: {} });
+  const acc = await api('POST', `/dispatch/${taken.data.id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  // Новый вызов приходит, пока A ведёт свой.
+  const next = await makeSubscribedUser('busy2');
+  const fresh = await api('POST', '/emergency/start', { token: next.token, body: {} });
+
+  const poolA = await api('GET', '/dispatch/pool?limit=100', { token: OPS.a.token });
+  assert.equal(poolA.status, 200);
+  assert.equal(poolA.data.total, 0, 'у занятого оператора пул обязан быть пустым');
+
+  // B на смене и свободен — вызов достаётся ему.
+  await setShift(OPS.b, true);
+  const poolB = await api('GET', '/dispatch/pool?limit=100', { token: OPS.b.token });
+  assert.ok(
+    poolB.data.data.some((x) => x.id === fresh.data.id),
+    'свободный оператор обязан видеть вызов, который не показали занятому',
+  );
+
+  // Второй вызов занятому принять нельзя — иначе интерфейс прячет, а API отдаёт.
+  const second = await api('POST', `/dispatch/${fresh.data.id}/accept`, { token: OPS.a.token });
+  assert.equal(second.status, 409, `${second.status} ${msgOf(second.data)}`);
+  assert.equal(second.data.code, 'OPERATOR_BUSY');
+
+  // Закрыл свой — пул вернулся.
+  const res = await api('POST', `/dispatch/${taken.data.id}/resolve`, {
+    token: OPS.a.token,
+    body: { resolution: 'проверка занятости' },
+  });
+  assert.equal(res.status, 200);
+
+  const poolAfter = await api('GET', '/dispatch/pool?limit=100', { token: OPS.a.token });
+  assert.ok(
+    poolAfter.data.data.some((x) => x.id === fresh.data.id),
+    'после закрытия своего вызова пул обязан вернуться',
+  );
+
+  await api('POST', `/dispatch/${fresh.data.id}/accept`, { token: OPS.b.token });
+  await api('POST', `/dispatch/${fresh.data.id}/resolve`, {
+    token: OPS.b.token,
+    body: { resolution: 'cleanup' },
+  });
+  await setShift(OPS.b, false);
+});
+
+/* ======================= 8c. Мелочи ядра ======================= */
+
+test('повторное заступление не сбрасывает время начала смены', async () => {
+  await setShift(OPS.a, false);
+  const first = await api('POST', '/dispatch/shift/start', { token: OPS.a.token });
+  assert.equal(first.status, 200);
+  const startedAt = first.data.shiftStartedAt;
+  assert.ok(startedAt, 'время начала смены обязано быть выставлено');
+
+  await sleep(1100);
+  const again = await api('POST', '/dispatch/shift/start', { token: OPS.a.token });
+  assert.equal(again.status, 200);
+  assert.equal(
+    again.data.shiftStartedAt,
+    startedAt,
+    'повторный запрос не должен обнулять отсчёт смены',
+  );
+});
+
+test('координата пишется одним запросом и не проходит в закрытую сессию', async () => {
+  const u = await makeSubscribedUser('loc1');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  const id = s.data.id;
+
+  const ok = await api('POST', `/emergency/${id}/location`, {
+    token: u.token,
+    body: { latitude: 42.87, longitude: 74.59, accuracy: 12 },
+  });
+  assertOk(ok, 'location');
+  assert.equal(ok.data.latitude, 42.87);
+
+  // Чужой пользователь.
+  const other = await makeSubscribedUser('loc2');
+  const foreign = await api('POST', `/emergency/${id}/location`, {
+    token: other.token,
+    body: { latitude: 1, longitude: 2, accuracy: 3 },
+  });
+  assert.equal(foreign.status, 403);
+  assert.equal(foreign.data.code, 'NOT_YOUR_SESSION');
+
+  await api('POST', `/emergency/${id}/close`, { token: u.token });
+
+  const afterClose = await api('POST', `/emergency/${id}/location`, {
+    token: u.token,
+    body: { latitude: 42.88, longitude: 74.6, accuracy: 9 },
+  });
+  assert.equal(afterClose.status, 409, 'в закрытую сессию координаты не пишутся');
+  assert.equal(afterClose.data.code, 'SESSION_ALREADY_CLOSED');
+
+  const missing = await api('POST', '/emergency/00000000-0000-4000-8000-000000000000/location', {
+    token: u.token,
+    body: { latitude: 1, longitude: 2, accuracy: 3 },
+  });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.data.code, 'SESSION_NOT_FOUND');
+});
+
 /* ======================= 9. Сдача смены с открытыми вызовами ======================= */
 
 test('сдать смену с незакрытым вызовом нельзя (409 с числом)', async () => {
@@ -564,7 +671,8 @@ test('сдать смену с незакрытым вызовом нельзя 
 
   const end = await api('POST', '/dispatch/shift/end', { token: OPS.a.token });
   assert.equal(end.status, 409, `${end.status} ${msgOf(end.data)}`);
-  assert.match(msgOf(end.data), /1/);
+  assert.equal(end.data.code, 'SHIFT_HAS_OPEN_SESSIONS');
+  assert.equal(end.data.openSessions, 1);
 
   // Закрыли — теперь смена сдаётся.
   await api('POST', `/dispatch/${s.data.id}/resolve`, {
@@ -579,10 +687,11 @@ test('сдать смену с незакрытым вызовом нельзя 
 /* ======================= 10. Админ ======================= */
 
 test('/admin/operators отдаёт смену и не отдаёт организации', async () => {
-  const r = await api('GET', '/admin/operators', { token: T.admin });
+  const r = await api('GET', '/admin/operators?limit=100', { token: T.admin });
   assert.equal(r.status, 200);
-  assert.ok(Array.isArray(r.data) && r.data.length >= 3);
-  const op = r.data.find((o) => o.id === OPS.a.id);
+  assert.ok(Array.isArray(r.data.data) && r.data.data.length >= 3);
+  assert.equal(typeof r.data.total, 'number', 'ответ обязан быть страничным');
+  const op = r.data.data.find((o) => o.id === OPS.a.id);
   assert.ok(op, 'сидовый оператор должен быть в списке');
   assert.equal(typeof op.onShift, 'boolean');
   assert.ok('shiftStartedAt' in op);
@@ -590,13 +699,36 @@ test('/admin/operators отдаёт смену и не отдаёт органи
   assert.equal(typeof op.activeSessionCount, 'number');
 });
 
-test('/admin/operators игнорирует organizationId (операторы общие)', async () => {
-  const all = await api('GET', '/admin/operators', { token: T.admin });
-  const filtered = await api('GET', '/admin/operators?organizationId=whatever', {
+test('/admin/operators не принимает organizationId (операторы общие)', async () => {
+  // Раньше параметр молча игнорировался. С появлением DTO у маршрута он
+  // отвергается явно — так убранный фильтр не вернётся незамеченным.
+  const filtered = await api(
+    'GET',
+    '/admin/operators?limit=100&organizationId=whatever',
+    { token: T.admin },
+  );
+  assert.equal(filtered.status, 400, `${filtered.status} ${msgOf(filtered.data)}`);
+});
+
+test('списки операторов и организаций страничные', async () => {
+  const firstPage = await api('GET', '/admin/operators?page=1&limit=1', {
     token: T.admin,
   });
-  assert.equal(filtered.status, 200);
-  assert.equal(filtered.data.length, all.data.length);
+  assert.equal(firstPage.status, 200);
+  assert.equal(firstPage.data.limit, 1);
+  assert.equal(firstPage.data.data.length, 1, 'страница обязана быть обрезана');
+  assert.ok(firstPage.data.total > 1, 'total считает всех, а не страницу');
+
+  const orgs = await api('GET', '/admin/organizations?page=1&limit=1', {
+    token: T.admin,
+  });
+  assert.equal(orgs.status, 200);
+  assert.ok(Array.isArray(orgs.data.data));
+  assert.equal(typeof orgs.data.total, 'number');
+
+  // Верхняя граница страницы защищена валидацией.
+  const tooBig = await api('GET', '/admin/operators?limit=1000', { token: T.admin });
+  assert.equal(tooBig.status, 400, 'limit сверх сотни не принимается');
 });
 
 test('админ ставит и снимает оператора со смены', async () => {
@@ -710,7 +842,16 @@ function connect(token) {
     reconnection: false,
   });
   const events = [];
-  for (const name of ['emergency:new', 'emergency:bootstrap', 'emergency:assigned']) {
+  for (const name of [
+    'emergency:new',
+    'emergency:bootstrap',
+    'emergency:assigned',
+    'emergency:in_progress',
+    'emergency:closed',
+    'emergency:reassigned',
+    'emergency:location_update',
+    'emergency:pool_removed',
+  ]) {
     socket.on(name, (payload) => events.push({ name, payload }));
   }
   return { socket, events };
@@ -727,12 +868,15 @@ const waitFor = (predicate, ms = 4000) =>
     tick();
   });
 
-test('WS: новый SOS уходит админу и дежурному, но не оператору вне смены', { skip: wsSkip }, async () => {
+test('WS: новый SOS уходит админу и дежурному, но не оператору вне смены', { skip: wsSkip }, async (t) => {
   await setShift(OPS.a, true);
   await setShift(OPS.b, false);
   const admin = connect(T.admin);
   const onShift = connect(OPS.a.token);
   const offShift = connect(OPS.b.token);
+  t.after(() => {
+    for (const c of [admin, onShift, offShift]) c.socket.disconnect();
+  });
 
   const connected = await waitFor(
     () => admin.socket.connected && onShift.socket.connected && offShift.socket.connected,
@@ -774,8 +918,321 @@ test('WS: новый SOS уходит админу и дежурному, но �
     token: OPS.a.token,
     body: { resolution: 'ws cleanup' },
   });
+});
 
-  for (const c of [admin, onShift, offShift]) c.socket.disconnect();
+test('WS: занятый оператор не получает emergency:new, свободный получает', { skip: wsSkip }, async (t) => {
+  await setShift(OPS.a, true);
+  await setShift(OPS.b, true);
+  const busy = connect(OPS.a.token);
+  const free = connect(OPS.b.token);
+  t.after(() => {
+    for (const c of [busy, free]) c.socket.disconnect();
+  });
+  assert.ok(
+    await waitFor(() => busy.socket.connected && free.socket.connected),
+    'оба сокета должны подключиться',
+  );
+
+  // A занимает вызов и становится занятым.
+  const u1 = await makeSubscribedUser('wsbusy1');
+  const taken = await api('POST', '/emergency/start', { token: u1.token, body: {} });
+  const acc = await api('POST', `/dispatch/${taken.data.id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  const u2 = await makeSubscribedUser('wsbusy2');
+  const fresh = await api('POST', '/emergency/start', { token: u2.token, body: {} });
+  const id = fresh.data.id;
+
+  const freeGot = await waitFor(() =>
+    free.events.some((e) => e.name === 'emergency:new' && e.payload?.id === id),
+  );
+  assert.ok(freeGot, 'свободный дежурный обязан получить emergency:new');
+
+  const busyGot = busy.events.some((e) => e.name === 'emergency:new' && e.payload?.id === id);
+  assert.equal(busyGot, false, 'занятый оператор не должен получать emergency:new');
+
+  await api('POST', `/dispatch/${taken.data.id}/resolve`, {
+    token: OPS.a.token,
+    body: { resolution: 'ws busy cleanup' },
+  });
+  await api('POST', `/dispatch/${id}/accept`, { token: OPS.b.token });
+  await api('POST', `/dispatch/${id}/resolve`, {
+    token: OPS.b.token,
+    body: { resolution: 'ws busy cleanup' },
+  });
+  await setShift(OPS.b, false);
+});
+
+test('WS: чужой вызов не уносит персональные данные к другим операторам', { skip: wsSkip }, async (t) => {
+  await setShift(OPS.a, true);
+  await setShift(OPS.b, true);
+  const a = connect(OPS.a.token);
+  const b = connect(OPS.b.token);
+  t.after(() => {
+    for (const c of [a, b]) c.socket.disconnect();
+  });
+  assert.ok(await waitFor(() => a.socket.connected && b.socket.connected), 'сокеты должны подняться');
+
+  const u = await makeSubscribedUser('leak1');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  const id = s.data.id;
+  assert.ok(await waitFor(() => b.events.some((e) => e.name === 'emergency:new' && e.payload?.id === id)));
+
+  // A принимает вызов.
+  const acc = await api('POST', `/dispatch/${id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  // B узнаёт об этом, но только идентификатором.
+  const gotRemoval = await waitFor(() =>
+    b.events.some((e) => e.name === 'emergency:pool_removed' && e.payload?.id === id),
+  );
+  assert.ok(gotRemoval, 'свободный оператор обязан получить emergency:pool_removed');
+
+  const removal = b.events.find((e) => e.name === 'emergency:pool_removed' && e.payload?.id === id);
+  assert.deepEqual(Object.keys(removal.payload), ['id'], 'в payload не должно быть ничего, кроме id');
+
+  const bGotAssigned = b.events.some((e) => e.name === 'emergency:assigned' && e.payload?.id === id);
+  assert.equal(bGotAssigned, false, 'чужому оператору не должна уходить полная сессия');
+
+  // А принявший — получает полную.
+  const aAssigned = a.events.find((e) => e.name === 'emergency:assigned' && e.payload?.id === id);
+  assert.ok(aAssigned, 'принявший оператор обязан получить emergency:assigned');
+  assert.ok(aAssigned.payload.user, 'принявшему нужна полная сессия с заявителем');
+
+  // Координаты по чужому вызову тоже не уходят.
+  const loc = await api('POST', `/emergency/${id}/location`, {
+    token: u.token,
+    body: { latitude: 42.87, longitude: 74.59, accuracy: 10 },
+  });
+  assertOk(loc, 'location');
+  assert.ok(
+    await waitFor(() => a.events.some((e) => e.name === 'emergency:location_update')),
+    'координаты обязаны дойти до назначенного оператора',
+  );
+  const bGotLocation = b.events.some(
+    (e) => e.name === 'emergency:location_update' && e.payload?.session?.id === id,
+  );
+  assert.equal(bGotLocation, false, 'чужому оператору координаты не отправляются');
+
+  await api('POST', `/dispatch/${id}/resolve`, {
+    token: OPS.a.token,
+    body: { resolution: 'leak cleanup' },
+  });
+  await setShift(OPS.b, false);
+});
+
+test('WS: снятие назначения возвращает вызов свободным дежурным', { skip: wsSkip }, async (t) => {
+  await setShift(OPS.a, true);
+  await setShift(OPS.b, true);
+  const a = connect(OPS.a.token);
+  const b = connect(OPS.b.token);
+  t.after(() => {
+    for (const c of [a, b]) c.socket.disconnect();
+  });
+  assert.ok(await waitFor(() => a.socket.connected && b.socket.connected));
+
+  const u = await makeSubscribedUser('unassign1');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  const id = s.data.id;
+  const acc = await api('POST', `/dispatch/${id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  b.events.length = 0;
+  a.events.length = 0;
+
+  const un = await api('POST', `/admin/emergencies/${id}/unassign`, { token: T.admin });
+  assertOk(un, 'unassign');
+
+  // Прежний исполнитель узнаёт, что вызов ушёл.
+  assert.ok(
+    await waitFor(() => a.events.some((e) => e.name === 'emergency:reassigned' && e.payload?.id === id)),
+    'прежний исполнитель обязан узнать о снятии назначения',
+  );
+  // Свободные дежурные снова видят его как предложение.
+  assert.ok(
+    await waitFor(() => b.events.some((e) => e.name === 'emergency:new' && e.payload?.id === id)),
+    'вернувшийся в пул вызов обязан прийти свободным дежурным',
+  );
+
+  await api('POST', `/admin/emergencies/${id}/close`, {
+    token: T.admin,
+    body: { resolution: 'unassign cleanup' },
+  });
+  await setShift(OPS.b, false);
+});
+
+test('админ не назначит вызов занятому оператору', async () => {
+  const u1 = await makeSubscribedUser('busyassign1');
+  const first = await api('POST', '/emergency/start', { token: u1.token, body: {} });
+  const acc = await api('POST', `/dispatch/${first.data.id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  const u2 = await makeSubscribedUser('busyassign2');
+  const second = await api('POST', '/emergency/start', { token: u2.token, body: {} });
+  const r = await api('POST', `/admin/emergencies/${second.data.id}/assign`, {
+    token: T.admin,
+    body: { operatorId: OPS.a.id },
+  });
+  assert.equal(r.status, 409, `${r.status} ${msgOf(r.data)}`);
+  assert.equal(r.data.code, 'OPERATOR_BUSY');
+  assert.equal(r.data.openSessions, 1);
+
+  await api('POST', `/dispatch/${first.data.id}/resolve`, {
+    token: OPS.a.token,
+    body: { resolution: 'busy assign cleanup' },
+  });
+  await api('POST', `/admin/emergencies/${second.data.id}/close`, {
+    token: T.admin,
+    body: { resolution: 'busy assign cleanup' },
+  });
+});
+
+test('карточка вызова доступна назначенному оператору и закрытая тоже', async () => {
+  const u = await makeSubscribedUser('detail1');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  const id = s.data.id;
+
+  // Чужому оператору карточка не отдаётся.
+  await setShift(OPS.b, true);
+  const foreign = await api('GET', `/emergency/${id}`, { token: OPS.b.token });
+  assert.equal(foreign.status, 403, `${foreign.status} ${msgOf(foreign.data)}`);
+  assert.equal(foreign.data.code, 'NOT_ASSIGNED_TO_SESSION');
+  await setShift(OPS.b, false);
+
+  const acc = await api('POST', `/dispatch/${id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  const mine = await api('GET', `/emergency/${id}`, { token: OPS.a.token });
+  assert.equal(mine.status, 200);
+  assert.equal(mine.data.id, id);
+  assert.ok(mine.data.user, 'в карточке обязан быть заявитель');
+
+  // Ради этого всё и делалось: закрытый вызов раньше не открывался вообще.
+  const res = await api('POST', `/dispatch/${id}/resolve`, {
+    token: OPS.a.token,
+    body: { resolution: 'detail cleanup' },
+  });
+  assert.equal(res.status, 200);
+
+  const closed = await api('GET', `/emergency/${id}`, { token: OPS.a.token });
+  assert.equal(closed.status, 200, 'закрытый вызов обязан открываться');
+  assert.equal(closed.data.status, 'CLOSED');
+
+  const missing = await api('GET', '/emergency/00000000-0000-4000-8000-000000000000', {
+    token: OPS.a.token,
+  });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.data.code, 'SESSION_NOT_FOUND');
+});
+
+test('GET /emergency/:id не перехватывает /emergency/history и /emergency/active', async () => {
+  const hist = await api('GET', '/emergency/history', { token: T.user });
+  assert.equal(hist.status, 200, 'history обязан остаться за USER');
+  assert.ok(Array.isArray(hist.data.data));
+
+  const active = await api('GET', '/emergency/active', { token: OPS.a.token });
+  assert.equal(active.status, 200, 'active обязан остаться за оператором');
+  assert.ok(Array.isArray(active.data.data));
+});
+
+/* ======================= 10b. Карточка оператора в админке ======================= */
+
+test('админ правит оператора, меняет пароль и мягко удаляет', async () => {
+  const op = await makeOperator('crud');
+
+  // Карточка.
+  const card = await api('GET', `/admin/operators/${op.id}`, { token: T.admin });
+  assert.equal(card.status, 200);
+  assert.equal(card.data.email, op.email);
+  assert.equal(card.data.activeSessionCount, 0);
+
+  // Правка данных.
+  const upd = await api('PATCH', `/admin/operators/${op.id}`, {
+    token: T.admin,
+    body: { displayName: 'Иван Петров', phone: '+996555112233' },
+  });
+  assert.equal(upd.status, 200);
+  assert.equal(upd.data.displayName, 'Иван Петров');
+  assert.equal(upd.data.phone, '+996555112233');
+
+  // Занятый email.
+  const dup = await api('PATCH', `/admin/operators/${op.id}`, {
+    token: T.admin,
+    body: { email: SEED.operator.email },
+  });
+  assert.equal(dup.status, 409);
+  assert.equal(dup.data.code, 'EMAIL_ALREADY_REGISTERED');
+
+  // Кривой телефон не проходит валидацию.
+  const badPhone = await api('PATCH', `/admin/operators/${op.id}`, {
+    token: T.admin,
+    body: { phone: '8905123' },
+  });
+  assert.equal(badPhone.status, 400);
+
+  // Смена пароля: старый перестаёт работать, новый работает.
+  const newPassword = 'Changed!2345';
+  const pwd = await api('POST', `/admin/operators/${op.id}/password`, {
+    token: T.admin,
+    body: { password: newPassword },
+  });
+  assert.equal(pwd.status, 200);
+
+  const oldLogin = await api('POST', '/auth/login', {
+    body: { email: op.email, password: 'Operator!2345' },
+  });
+  assert.equal(oldLogin.status, 401, 'старый пароль обязан перестать работать');
+  const freshToken = await login(op.email, newPassword);
+  assert.ok(freshToken, 'новый пароль обязан работать');
+
+  // Удаление с незакрытым вызовом запрещено.
+  await api('POST', '/dispatch/shift/start', { token: freshToken });
+  const u = await makeSubscribedUser('crudsos');
+  const sos = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  const acc = await api('POST', `/dispatch/${sos.data.id}/accept`, { token: freshToken });
+  assert.equal(acc.status, 200);
+
+  const blocked = await api('DELETE', `/admin/operators/${op.id}`, { token: T.admin });
+  assert.equal(blocked.status, 409, `${blocked.status} ${msgOf(blocked.data)}`);
+  assert.equal(blocked.data.code, 'SHIFT_HAS_OPEN_SESSIONS');
+  assert.equal(blocked.data.openSessions, 1);
+
+  await api('POST', `/dispatch/${sos.data.id}/resolve`, {
+    token: freshToken,
+    body: { resolution: 'crud cleanup' },
+  });
+
+  // Мягкое удаление.
+  const del = await api('DELETE', `/admin/operators/${op.id}`, { token: T.admin });
+  assert.equal(del.status, 200);
+  assert.equal(del.data.deleted, true);
+
+  // Войти нельзя, в списке нет, карточки нет, назначить нельзя.
+  const afterLogin = await api('POST', '/auth/login', {
+    body: { email: op.email, password: newPassword },
+  });
+  assert.equal(afterLogin.status, 401, 'удалённый оператор не должен входить');
+
+  const list = await api('GET', '/admin/operators?limit=100', { token: T.admin });
+  assert.ok(
+    !list.data.data.some((o) => o.id === op.id),
+    'удалённого нет в списке',
+  );
+
+  const gone = await api('GET', `/admin/operators/${op.id}`, { token: T.admin });
+  assert.equal(gone.status, 404);
+
+  const assignDeleted = await api(
+    `POST`,
+    `/admin/emergencies/${sos.data.id}/assign`,
+    { token: T.admin, body: { operatorId: op.id } },
+  );
+  assert.equal(assignDeleted.status, 400, 'на удалённого назначать нельзя');
+
+  // Главное ради чего мягкое: история вызова уцелела.
+  const history = await api('GET', `/admin/emergencies/${sos.data.id}`, { token: T.admin });
+  assert.equal(history.status, 200);
+  assert.equal(history.data.assignedOperatorId, op.id, 'исполнитель обязан остаться в истории');
 });
 
 test('WS: подключение без токена отвергается', { skip: wsSkip }, async () => {
@@ -796,7 +1253,7 @@ const SLOW = process.env.E2E_SLOW === '1';
 
 test(
   'cron возвращает вызов в пул и снимает смену с недоступного оператора',
-  { skip: SLOW ? false : 'нужен E2E_SLOW=1 (тест длится ~2.5 минуты)' },
+  { skip: SLOW ? false : 'нужен E2E_SLOW=1 (тест длится ~4 минуты)' },
   async () => {
     await setShift(OPS.b, true);
     const u = await makeSubscribedUser('cron');
@@ -810,9 +1267,9 @@ test(
     // Оператор «пропал»: телефон сел, приложение убито.
     pausedOps.add(OPS.b.email);
 
-    // ONLINE_THRESHOLD_MS = 35 c, cron тикает раз в 30 с.
+    // RECLAIM_ASSIGNMENT_THRESHOLD_MS = 120 c, cron тикает раз в 30 с.
     let backInPool = false;
-    for (let i = 0; i < 15 && !backInPool; i++) {
+    for (let i = 0; i < 32 && !backInPool; i++) {
       await sleep(5000);
       const pool = await api('GET', '/dispatch/pool?limit=100', { token: OPS.a.token });
       backInPool = pool.data.data.some((x) => x.id === id);
@@ -823,12 +1280,13 @@ test(
     assert.equal(detail.data.status, 'NEW');
     assert.equal(detail.data.assignedOperatorId, null);
 
-    // SHIFT_ALIVE_THRESHOLD_MS = 120 c — дальше снимается и смена.
+    // SHIFT_ALIVE_THRESHOLD_MS = 180 c — дальше снимается и смена.
     let shiftDropped = false;
-    for (let i = 0; i < 22 && !shiftDropped; i++) {
+    for (let i = 0; i < 24 && !shiftDropped; i++) {
       await sleep(5000);
-      const ops = await api('GET', '/admin/operators', { token: T.admin });
-      shiftDropped = ops.data.find((o) => o.id === OPS.b.id)?.onShift === false;
+      const ops = await api('GET', '/admin/operators?limit=100', { token: T.admin });
+      shiftDropped =
+        ops.data.data.find((o) => o.id === OPS.b.id)?.onShift === false;
     }
     assert.ok(shiftDropped, 'смена недоступного оператора обязана быть снята');
 
