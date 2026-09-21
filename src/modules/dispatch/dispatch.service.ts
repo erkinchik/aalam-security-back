@@ -28,10 +28,7 @@ export class DispatchService {
           assignedOperatorId: operatorId,
         },
         data: { status: 'IN_PROGRESS' },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          assignedOperator: { select: { id: true, email: true } },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
       });
 
       this.wsGateway.emitEmergencyInProgress(
@@ -78,10 +75,7 @@ export class DispatchService {
           closedAt: new Date(),
           resolution,
         },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          assignedOperator: { select: { id: true, email: true } },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
       });
 
       this.wsGateway.emitEmergencyClosed(
@@ -112,10 +106,7 @@ export class DispatchService {
     const [data, total] = await Promise.all([
       this.prisma.emergencySession.findMany({
         where: { assignedOperatorId: operatorId },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          locations: { orderBy: { createdAt: 'desc' }, take: 1 },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,

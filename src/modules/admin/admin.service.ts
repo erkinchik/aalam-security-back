@@ -28,6 +28,7 @@ import {
   notFound,
 } from "../../common/errors/app.exception";
 import { anonymizedEmailFor } from "../../common/constants/anonymize";
+import { OPERATOR_SESSION_INCLUDE } from "../../common/prisma/operator-session.include";
 import {
   isHeartbeatFresh,
   parseHeartbeat,
@@ -170,25 +171,7 @@ export class AdminService {
           assignedOperatorId: operatorId,
           status: "ASSIGNED",
         },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          organization: { select: { id: true, name: true } },
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              address: true,
-              apartment: true,
-              floor: true,
-              entrance: true,
-              doorCode: true,
-              addressNotes: true,
-              latitude: true,
-              longitude: true,
-            },
-          },
-          assignedOperator: { select: { id: true, email: true } },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
       });
 
       this.wsGateway.emitEmergencyAssigned(
@@ -231,25 +214,7 @@ export class AdminService {
           assignedOperatorId: operatorId,
           status: "ASSIGNED",
         },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          organization: { select: { id: true, name: true } },
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              address: true,
-              apartment: true,
-              floor: true,
-              entrance: true,
-              doorCode: true,
-              addressNotes: true,
-              latitude: true,
-              longitude: true,
-            },
-          },
-          assignedOperator: { select: { id: true, email: true } },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
       });
 
       this.wsGateway.emitEmergencyReassigned(
@@ -289,24 +254,7 @@ export class AdminService {
           assignedOperatorId: null,
           status: "NEW",
         },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          organization: { select: { id: true, name: true } },
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              address: true,
-              apartment: true,
-              floor: true,
-              entrance: true,
-              doorCode: true,
-              addressNotes: true,
-              latitude: true,
-              longitude: true,
-            },
-          },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
       });
 
       this.wsGateway.emitEmergencyReassigned(

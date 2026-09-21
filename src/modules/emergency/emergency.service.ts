@@ -198,11 +198,9 @@ export class EmergencyService {
         venueId: sessionVenueId,
         emergencyType,
       },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: true,
-        venue: true,
-      },
+      // Та же форма, что у пула и снимка: карточка предложения у дежурного
+      // сразу показывает телефон заявителя и вход в объект.
+      include: OPERATOR_SESSION_INCLUDE,
     });
 
     void this.wsGateway.emitEmergencyNew(
@@ -237,14 +235,10 @@ export class EmergencyService {
             },
           },
         },
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          organization: true,
-          venue: true,
-          // Клиенту нужна последняя точка; раньше на каждый пинг всем
-          // получателям улетала история из тридцати координат.
-          locations: { orderBy: { createdAt: 'desc' }, take: 1 },
-        },
+        // Полная карточка: клиент оператора заменяет вызов этим payload, и без
+        // телефона и входа в объект они пропадали с экрана на первом же пинге.
+        // Из точек — только последняя, как и раньше.
+        include: OPERATOR_SESSION_INCLUDE,
       });
     } catch (err) {
       if (!isPrismaRowNotFound(err)) throw err;
@@ -318,26 +312,7 @@ export class EmergencyService {
     const [data, total] = await Promise.all([
       this.prisma.emergencySession.findMany({
         where,
-        include: {
-          user: { select: { id: true, email: true, role: true } },
-          organization: { select: { id: true, name: true } },
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              address: true,
-              apartment: true,
-              floor: true,
-              entrance: true,
-              doorCode: true,
-              addressNotes: true,
-              latitude: true,
-              longitude: true,
-            },
-          },
-          locations: { orderBy: { createdAt: 'desc' as const }, take: 1 },
-          assignedOperator: { select: { id: true, email: true } },
-        },
+        include: OPERATOR_SESSION_INCLUDE,
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,

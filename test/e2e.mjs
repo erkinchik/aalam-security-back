@@ -901,6 +901,8 @@ test('WS: новый SOS уходит админу и дежурному, но �
   );
   assert.ok(adminGot, 'админ обязан получить emergency:new');
   assert.ok(onShiftGot, 'дежурный оператор обязан получить emergency:new');
+  const offer = onShift.events.find((e) => e.name === 'emergency:new' && e.payload?.id === id);
+  assert.ok('phone' in offer.payload.user, 'предложение обязано нести телефон заявителя');
 
   const offShiftGot = offShift.events.some(
     (e) => e.name === 'emergency:new' && e.payload?.id === id,
@@ -913,6 +915,26 @@ test('WS: новый SOS уходит админу и дежурному, но �
     onShift.events.some((e) => e.name === 'emergency:assigned' && e.payload?.id === id),
   );
   assert.ok(assignedBroadcast, 'после приёма обязан прийти emergency:assigned');
+
+  // Клиент заменяет вызов тем, что пришло. Урезанная карточка стирала у
+  // оператора телефон, адрес и кнопку маршрута сразу после «Начать работу».
+  const prog = await api('POST', `/dispatch/${id}/start-progress`, { token: OPS.a.token });
+  assertOk(prog, 'start-progress');
+  assert.ok(
+    'phone' in prog.data.user && 'venue' in prog.data && Array.isArray(prog.data.locations),
+    'ответ start-progress обязан быть полной карточкой',
+  );
+  const gotInProgress = await waitFor(() =>
+    onShift.events.some((e) => e.name === 'emergency:in_progress' && e.payload?.id === id),
+  );
+  assert.ok(gotInProgress, 'назначенный оператор обязан получить emergency:in_progress');
+  const inProgress = onShift.events.find(
+    (e) => e.name === 'emergency:in_progress' && e.payload?.id === id,
+  );
+  assert.ok(
+    'phone' in inProgress.payload.user && 'venue' in inProgress.payload,
+    'событие in_progress обязано быть полной карточкой',
+  );
 
   await api('POST', `/dispatch/${id}/resolve`, {
     token: OPS.a.token,
