@@ -90,7 +90,7 @@ const SEED = {
   },
   operator: {
     email: 'operator@sos-security.com',
-    password: process.env.SEED_OPERATOR_PASSWORD ?? 'operator123',
+    password: process.env.SEED_OPERATOR_PASSWORD ?? '123456',
   },
   user: {
     email: 'user@example.com',

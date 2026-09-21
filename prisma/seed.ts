@@ -29,7 +29,7 @@ const SEED_USERS = [
   },
   {
     email: 'operator@sos-security.com',
-    password: process.env.SEED_OPERATOR_PASSWORD ?? 'operator123',
+    password: process.env.SEED_OPERATOR_PASSWORD ?? '123456',
     role: 'OPERATOR' as const,
     phone: '+996555000002',
     note: 'оператор',
@@ -43,7 +43,7 @@ const SEED_USERS = [
   },
   {
     email: 'subscriber@example.com',
-    password: process.env.SEED_SUBSCRIBER_PASSWORD ?? 'subscriber123',
+    password: process.env.SEED_SUBSCRIBER_PASSWORD ?? '123456',
     role: 'USER' as const,
     phone: '+996555000004',
     subscription: true,
@@ -51,14 +51,14 @@ const SEED_USERS = [
   },
   {
     email: 'owner@example.com',
-    password: process.env.SEED_OWNER_PASSWORD ?? 'owner123456',
+    password: process.env.SEED_OWNER_PASSWORD ?? '123456',
     role: 'USER' as const,
     phone: '+996555000005',
     note: 'владелец ЧОП «Беркут» — выбор объекта при вызове, коды приглашений',
   },
   {
     email: 'employee@example.com',
-    password: process.env.SEED_EMPLOYEE_PASSWORD ?? 'employee123',
+    password: process.env.SEED_EMPLOYEE_PASSWORD ?? '123456',
     role: 'USER' as const,
     phone: '+996555000006',
     note: 'сотрудник, привязан к «Офис на Чуй» — SOS с адресом объекта',
