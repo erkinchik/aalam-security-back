@@ -18,7 +18,10 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AdminService } from './admin.service';
+import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { CreateOperatorDto } from './dto/create-operator.dto';
+import { UpdateOperatorDto } from './dto/update-operator.dto';
+import { SetOperatorPasswordDto } from './dto/set-operator-password.dto';
 import { SetOperatorShiftDto } from './dto/set-operator-shift.dto';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
@@ -94,8 +97,41 @@ export class AdminController {
   @ApiOperation({
     summary: 'List operators with shift, workload and online status (ADMIN only)',
   })
-  getOperators() {
-    return this.adminService.getOperators();
+  getOperators(@Query() query: PaginationQueryDto) {
+    return this.adminService.getOperators(query.page ?? 1, query.limit ?? 20);
+  }
+
+  @Get('operators/:id')
+  @ApiOperation({ summary: 'Get one operator (ADMIN only)' })
+  getOperator(@Param('id') id: string) {
+    return this.adminService.getOperatorById(id);
+  }
+
+  @Patch('operators/:id')
+  @ApiOperation({ summary: 'Update operator email / name / phone (ADMIN only)' })
+  updateOperator(@Param('id') id: string, @Body() dto: UpdateOperatorDto) {
+    return this.adminService.updateOperator(id, dto);
+  }
+
+  @Post('operators/:id/password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Set a new password for an operator and revoke their sessions',
+  })
+  setOperatorPassword(
+    @Param('id') id: string,
+    @Body() dto: SetOperatorPasswordDto,
+  ) {
+    return this.adminService.setOperatorPassword(id, dto.password);
+  }
+
+  @Delete('operators/:id')
+  @ApiOperation({
+    summary:
+      'Soft-delete an operator: PII is wiped, call history is kept (409 with open sessions)',
+  })
+  deleteOperator(@Param('id') id: string) {
+    return this.adminService.deleteOperator(id);
   }
 
   @Post('operators/:id/shift')
@@ -113,8 +149,8 @@ export class AdminController {
 
   @Get('organizations')
   @ApiOperation({ summary: 'List organizations (ADMIN only)' })
-  getOrganizations() {
-    return this.adminService.getOrganizations();
+  getOrganizations(@Query() query: PaginationQueryDto) {
+    return this.adminService.getOrganizations(query.page ?? 1, query.limit ?? 20);
   }
 
   @Get('organizations/:id')
