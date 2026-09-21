@@ -8,17 +8,31 @@ import { EmergencyStatus } from '@prisma/client';
  * stored timestamp instead of relying on key existence.
  */
 
-/** TTL of the heartbeat key. Must be >= SHIFT_ALIVE_THRESHOLD_MS. */
-export const HEARTBEAT_TTL_SECONDS = 120;
+/** TTL of the heartbeat key. Must be >= the longest threshold below. */
+export const HEARTBEAT_TTL_SECONDS = 300;
 
-/** Operator counts as online (admin list, cron un-assigning stale sessions). */
+/** Зелёная точка «онлайн» в списке операторов у админа. Ни на что не влияет. */
 export const ONLINE_THRESHOLD_MS = 35_000;
+
+/**
+ * После какого молчания принятый вызов возвращается в пул.
+ *
+ * Раньше здесь стоял порог онлайна — 35 секунд. Оператор принимал вызов, ехал,
+ * экран гас, JS-таймер пульса замирал, и вызов уходил другому, пока человек был
+ * уже в дороге. Две минуты переживают гашение экрана и короткий провал связи;
+ * открытый сокет продлевает присутствие и без HTTP-пинга.
+ */
+export const RECLAIM_ASSIGNMENT_THRESHOLD_MS = 120_000;
 
 /**
  * Longer silence than this means the device is gone for good (app killed,
  * phone dead), so the shift is dropped and SOS stops being routed there.
+ *
+ * Строго больше RECLAIM_ASSIGNMENT_THRESHOLD_MS: вызовы обязаны освободиться
+ * раньше, чем снимется смена, иначе они зависнут на операторе, который уже
+ * ничего не получает.
  */
-export const SHIFT_ALIVE_THRESHOLD_MS = 120_000;
+export const SHIFT_ALIVE_THRESHOLD_MS = 180_000;
 
 /** Statuses that keep an operator busy — they block ending a shift. */
 export const OPEN_ASSIGNED_STATUSES = [

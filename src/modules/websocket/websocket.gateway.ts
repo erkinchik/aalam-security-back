@@ -11,6 +11,7 @@ import { EmergencyStatus } from '@prisma/client';
 import { Server, Socket } from 'socket.io';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
+import { OPEN_ASSIGNED_STATUSES } from '../../common/constants/operator-presence';
 
 /** Operators on shift — the only ones alerted about a fresh SOS. */
 export const ON_SHIFT_ROOM = 'on_shift_operators';
@@ -18,9 +19,17 @@ export const ON_SHIFT_ROOM = 'on_shift_operators';
 /** Per-operator room, so shift endpoints can move sockets without tracking them. */
 export const operatorRoom = (operatorId: string) => `operator_${operatorId}`;
 
-// Origin-check function read at decorator-eval time. Re-reads process.env on
-// each request so an env reload doesn't require a rebuild. Allows requests
-// with no Origin header (native mobile clients).
+/** За сколько до истечения токена предупредить клиента. */
+const TOKEN_EXPIRY_WARNING_MS = 60_000;
+
+/**
+ * Проверка Origin читается при вычислении декоратора, поэтому берём переменную
+ * окружения напрямую — ConfigService тут ещё недоступен.
+ *
+ * Пустой список закрывает доступ, а не открывает: у HTTP-CORS в `main.ts` ровно
+ * такое поведение, и расходиться им незачем. Запросы без Origin пропускаем —
+ * это нативные клиенты, и они всё равно предъявляют JWT.
+ */
 type OriginCallback = (err: Error | null, allow?: boolean) => void;
 function websocketOriginCheck(origin: string | undefined, cb: OriginCallback) {
   if (!origin) return cb(null, true);
@@ -28,9 +37,7 @@ function websocketOriginCheck(origin: string | undefined, cb: OriginCallback) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  if (allowed.length === 0 || allowed.includes(origin)) {
-    return cb(null, true);
-  }
+  if (allowed.includes(origin)) return cb(null, true);
   return cb(new Error(`Origin ${origin} not allowed by CORS`), false);
 }
 
@@ -59,6 +66,7 @@ export class WebsocketGateway
         client.handshake.headers?.authorization?.replace('Bearer ', '');
 
       if (!token) {
+        this.logger.debug('Socket rejected: no token in handshake');
         client.disconnect();
         return;
       }
@@ -67,15 +75,28 @@ export class WebsocketGateway
         secret: this.configService.get<string>('jwt.accessSecret'),
       });
 
-      client.data.user = { id: payload.sub, role: payload.role };
+      // Роль берём из базы, а не из payload: разжалованный или удалённый
+      // пользователь иначе сохранял бы прежние права до истечения токена.
+      const user = await this.prisma.user.findUnique({
+        where: { id: payload.sub },
+        select: { role: true, deletedAt: true },
+      });
+      if (!user || user.deletedAt) {
+        this.logger.warn(`Socket rejected: user ${payload.sub} is gone or deleted`);
+        client.disconnect();
+        return;
+      }
 
-      if (payload.role === 'ADMIN') {
+      client.data.user = { id: payload.sub, role: user.role };
+      this.scheduleTokenExpiry(client, payload.exp);
+
+      if (user.role === 'ADMIN') {
         client.join('admin_room');
         this.logger.log(`Admin ${payload.sub} connected`);
         // REL-6: replay open sessions so a reconnecting admin doesn't miss
         // events emitted while they were disconnected.
         void this.sendAdminBootstrap(client);
-      } else if (payload.role === 'OPERATOR') {
+      } else if (user.role === 'OPERATOR') {
         client.join('operators');
         // Personal room lets the HTTP shift endpoints move this operator in and
         // out of ON_SHIFT_ROOM without tracking sockets by hand.
@@ -86,9 +107,44 @@ export class WebsocketGateway
         client.join(`user_${payload.sub}`);
         this.logger.log(`User ${payload.sub} connected`);
       }
-    } catch {
+    } catch (err) {
+      // Раньше причина глушилась: протухший токен, неверный секрет и битый
+      // payload выглядели одинаково — «все отключаются», ноль строк в логе.
+      this.logger.warn(
+        `Socket handshake rejected: ${(err as Error)?.message ?? 'unknown reason'}`,
+      );
       client.disconnect();
     }
+  }
+
+  /**
+   * Токен проверялся только на хендшейке, а сокет жил часами: вышедший из
+   * системы оператор продолжал получать поток вызовов. Теперь соединение живёт
+   * ровно столько, сколько действует токен.
+   *
+   * За минуту до истечения шлём `auth:expiring` — клиент успевает обновить токен
+   * и переподключиться без разрыва.
+   */
+  private scheduleTokenExpiry(client: Socket, exp: unknown) {
+    if (typeof exp !== 'number') return;
+
+    const msLeft = exp * 1000 - Date.now();
+    if (msLeft <= 0) {
+      client.disconnect();
+      return;
+    }
+
+    const warnAt = Math.max(0, msLeft - TOKEN_EXPIRY_WARNING_MS);
+    const warnTimer = setTimeout(() => client.emit('auth:expiring'), warnAt);
+    const killTimer = setTimeout(() => {
+      this.logger.debug(`Socket ${client.data?.user?.id} closed: token expired`);
+      client.disconnect();
+    }, msLeft);
+
+    client.once('disconnect', () => {
+      clearTimeout(warnTimer);
+      clearTimeout(killTimer);
+    });
   }
 
   private async sendAdminBootstrap(client: Socket) {
@@ -124,31 +180,63 @@ export class WebsocketGateway
         client.join(ON_SHIFT_ROOM);
       }
 
-      const sessions = await this.prisma.emergencySession.findMany({
+      const mine = await this.prisma.emergencySession.findMany({
         where: {
-          OR: [
-            ...(operator?.onShift
-              ? [{ status: EmergencyStatus.NEW, assignedOperatorId: null }]
-              : []),
-            {
-              assignedOperatorId: operatorId,
-              status: {
-                in: [EmergencyStatus.ASSIGNED, EmergencyStatus.IN_PROGRESS],
-              },
-            },
-          ],
+          assignedOperatorId: operatorId,
+          status: { in: OPEN_ASSIGNED_STATUSES },
         },
         include: OPERATOR_SESSION_INCLUDE,
         orderBy: { createdAt: 'desc' },
-        take: 100,
       });
-      client.emit('emergency:bootstrap', { sessions });
+
+      // Оператор ведёт один вызов за раз: пока свой не закрыт, свободные ему
+      // не предлагаются — иначе после переподключения на карту вернулась бы
+      // карточка предложения поверх активного вызова.
+      const pool =
+        operator?.onShift && mine.length === 0
+          ? await this.prisma.emergencySession.findMany({
+              where: {
+                status: EmergencyStatus.NEW,
+                assignedOperatorId: null,
+              },
+              include: OPERATOR_SESSION_INCLUDE,
+              orderBy: { createdAt: 'desc' },
+              take: 100,
+            })
+          : [];
+
+      client.emit('emergency:bootstrap', { sessions: [...mine, ...pool] });
     } catch (err) {
       this.logger.error(
         'Failed to send operator bootstrap snapshot',
         err as Error,
       );
     }
+  }
+
+  /**
+   * Сообщает оператору, что смена окончена не по его команде: cron снял её из-за
+   * молчания, либо это сделал администратор. Без такого события клиент продолжал
+   * показывать «На смене», хотя сервер уже перестал слать ему вызовы.
+   */
+  emitShiftEnded(operatorId: string, reason: 'inactivity' | 'admin') {
+    this.server.to(operatorRoom(operatorId)).emit('operator:shift_ended', { reason });
+  }
+
+  /**
+   * Идентификаторы дежурных операторов, у которых прямо сейчас живой сокет.
+   * Socket.IO сам поддерживает ping/pong и отключает мёртвые соединения,
+   * поэтому открытый сокет — более честный признак присутствия, чем HTTP-пинг,
+   * который замирает, как только телефон уходит в фон.
+   */
+  async getConnectedOnShiftOperatorIds(): Promise<string[]> {
+    const sockets = await this.server.in(ON_SHIFT_ROOM).fetchSockets();
+    const ids = new Set<string>();
+    for (const socket of sockets) {
+      const id = (socket.data as { user?: { id?: string } })?.user?.id;
+      if (id) ids.add(id);
+    }
+    return [...ids];
   }
 
   /**
@@ -171,10 +259,90 @@ export class WebsocketGateway
     }
   }
 
-  emitEmergencyNew(session: Record<string, unknown>) {
-    // Only operators currently on shift are alerted; everyone else sees the
-    // session through the regular status events.
-    this.server.to(['admin_room', ON_SHIFT_ROOM]).emit('emergency:new', session);
+  /**
+   * Новый вызов уходит только свободным дежурным. Занятого он бы дёрнул
+   * сиреной посреди своего выезда, а принять всё равно нельзя.
+   *
+   * Список занятых считается на месте, а не поддерживается отдельной комнатой:
+   * рассинхрон такой комнаты стоил бы потерянного вызова, а запрос идёт по
+   * индексу assignedOperatorId.
+   */
+  async emitEmergencyNew(session: Record<string, unknown>) {
+    await this.offerToFreeOperators(session);
+  }
+
+  /**
+   * Вызов вернулся в пул — админ снял назначение или cron вернул зависший.
+   * Свободные дежурные должны увидеть его как обычное предложение, поэтому
+   * событие то же самое: клиенту незачем различать «новый» и «вернувшийся».
+   */
+  async emitPoolReturned(session: Record<string, unknown>) {
+    await this.offerToFreeOperators(session);
+  }
+
+  private async offerToFreeOperators(session: Record<string, unknown>) {
+    let busyRooms: string[] = [];
+    try {
+      busyRooms = await this.busyOperatorRooms();
+    } catch (err) {
+      // Показать вызов занятому — мелкая помеха, не показать никому — потеря
+      // тревоги. При сбое запроса шлём всем дежурным.
+      this.logger.error(
+        'Failed to resolve busy operators; broadcasting SOS to every operator on shift',
+        err as Error,
+      );
+    }
+    this.server
+      .to(['admin_room', ON_SHIFT_ROOM])
+      .except(busyRooms)
+      .emit('emergency:new', session);
+  }
+
+  /**
+   * Вызов перестал быть свободным: приняли, назначили или закрыли до приёма.
+   * Дежурным уходит один идентификатор — им нужно лишь убрать карточку, а
+   * полная сессия содержит имя, телефон, адрес и координаты заявителя, и
+   * показывать её тем, кто с вызовом не работает, незачем.
+   */
+  emitPoolRemoved(sessionId: string) {
+    this.server.to(ON_SHIFT_ROOM).emit('emergency:pool_removed', { id: sessionId });
+  }
+
+  /**
+   * Комнаты, которым положена полная сессия: администраторы, заявитель и те
+   * операторы, что с вызовом работают. Раньше сюда входила общая комната
+   * `operators`, и персональные данные уходили каждому подключённому оператору.
+   */
+  private sessionRooms(
+    userId: string | null | undefined,
+    ...operatorIds: (string | null | undefined)[]
+  ): string[] {
+    const rooms = new Set<string>(['admin_room']);
+    if (userId) rooms.add(`user_${userId}`);
+    for (const id of operatorIds) {
+      if (id) rooms.add(operatorRoom(id));
+    }
+    return [...rooms];
+  }
+
+  private assigneeOf(session: Record<string, unknown>): string | null {
+    const id = session.assignedOperatorId;
+    return typeof id === 'string' ? id : null;
+  }
+
+  /** Персональные комнаты операторов, у которых уже есть незакрытый вызов. */
+  private async busyOperatorRooms(): Promise<string[]> {
+    const busy = await this.prisma.emergencySession.findMany({
+      where: {
+        status: { in: OPEN_ASSIGNED_STATUSES },
+        assignedOperatorId: { not: null },
+      },
+      select: { assignedOperatorId: true },
+      distinct: ['assignedOperatorId'],
+    });
+    return busy.flatMap((s) =>
+      s.assignedOperatorId ? [operatorRoom(s.assignedOperatorId)] : [],
+    );
   }
 
   emitLocationUpdate(
@@ -184,33 +352,49 @@ export class WebsocketGateway
   ) {
     const payload = { session, location };
     this.server
-      .to(['admin_room', 'operators', `user_${userId}`])
+      .to(this.sessionRooms(userId, this.assigneeOf(session)))
       .emit('emergency:location_update', payload);
   }
 
   emitEmergencyAssigned(userId: string, session: Record<string, unknown>) {
     this.server
-      .to(['admin_room', 'operators', `user_${userId}`])
+      .to(this.sessionRooms(userId, this.assigneeOf(session)))
       .emit('emergency:assigned', session);
   }
 
-  emitEmergencyClosed(userId: string, session: Record<string, unknown>) {
+  /**
+   * `previousOperatorId` нужен админскому закрытию: оно обнуляет исполнителя тем
+   * же запросом, и без явной передачи оператор, который вёл вызов, не узнал бы,
+   * что его закрыли.
+   */
+  emitEmergencyClosed(
+    userId: string,
+    session: Record<string, unknown>,
+    previousOperatorId?: string | null,
+  ) {
     this.server
-      .to(['admin_room', 'operators', `user_${userId}`])
+      .to(this.sessionRooms(userId, this.assigneeOf(session), previousOperatorId))
       .emit('emergency:closed', session);
   }
 
   emitEmergencyInProgress(userId: string, session: Record<string, unknown>) {
     this.server
-      .to(['admin_room', 'operators', `user_${userId}`])
+      .to(this.sessionRooms(userId, this.assigneeOf(session)))
       .emit('emergency:in_progress', session);
   }
 
-  emitEmergencyReassigned(session: Record<string, unknown>) {
-    const rooms: string[] = ['admin_room', 'operators'];
+  /**
+   * Прежнего исполнителя уведомляем отдельно: иначе оператор, у которого забрали
+   * вызов, просто видел, как карточка исчезает с карты.
+   */
+  emitEmergencyReassigned(
+    session: Record<string, unknown>,
+    previousOperatorId?: string | null,
+  ) {
     const userId = session.userId as string | undefined;
-    if (userId) rooms.push(`user_${userId}`);
-    this.server.to(rooms).emit('emergency:reassigned', session);
+    this.server
+      .to(this.sessionRooms(userId, this.assigneeOf(session), previousOperatorId))
+      .emit('emergency:reassigned', session);
   }
 
   emitSubscriptionApproved(

@@ -1,14 +1,11 @@
-import {
-  Injectable,
-  ConflictException,
-  NotFoundException,
-  ForbiddenException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { EmergencyStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
+import { ErrorCode } from '../../common/errors/error-codes';
+import { conflict, forbidden, notFound } from '../../common/errors/app.exception';
 import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
 import { OPEN_ASSIGNED_STATUSES } from '../../common/constants/operator-presence';
 
@@ -49,12 +46,17 @@ export class DispatchService {
         where: { id: sessionId },
         select: { status: true, assignedOperatorId: true },
       });
-      if (!session) throw new NotFoundException('Session not found');
+      if (!session) throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
       if (session.assignedOperatorId !== operatorId) {
-        throw new ForbiddenException('You are not assigned to this session');
+        throw forbidden(
+          ErrorCode.NOT_ASSIGNED_TO_SESSION,
+          'You are not assigned to this session',
+        );
       }
-      throw new ConflictException(
+      throw conflict(
+        ErrorCode.SESSION_WRONG_STATUS,
         `Session must be in ASSIGNED status (current: ${session.status})`,
+        { status: session.status },
       );
     }
   }
@@ -82,11 +84,11 @@ export class DispatchService {
         },
       });
 
-      await this.redis.removeActiveEmergency(sessionId);
       this.wsGateway.emitEmergencyClosed(
         updated.userId,
         updated as unknown as Record<string, unknown>,
       );
+      this.wsGateway.emitPoolRemoved(sessionId);
       return updated;
     } catch (err) {
       if (!isPrismaRowNotFound(err)) throw err;
@@ -94,11 +96,14 @@ export class DispatchService {
         where: { id: sessionId },
         select: { status: true, assignedOperatorId: true },
       });
-      if (!session) throw new NotFoundException('Session not found');
+      if (!session) throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
       if (session.assignedOperatorId !== operatorId) {
-        throw new ForbiddenException('You are not assigned to this session');
+        throw forbidden(
+          ErrorCode.NOT_ASSIGNED_TO_SESSION,
+          'You are not assigned to this session',
+        );
       }
-      throw new ConflictException('Session is already closed');
+      throw conflict(ErrorCode.SESSION_ALREADY_CLOSED, 'Session is already closed');
     }
   }
 
@@ -147,9 +152,15 @@ export class DispatchService {
   }
 
   async startShift(operatorId: string) {
-    const operator = await this.prisma.user.update({
-      where: { id: operatorId },
+    // Время начала ставим только на переходе «не на смене → на смене». Иначе
+    // повторный запрос (второй тап по ползунку, ретрай клиента) обнулял бы
+    // отсчёт, и учёт рабочего времени по этому полю врал бы.
+    await this.prisma.user.updateMany({
+      where: { id: operatorId, onShift: false },
       data: { onShift: true, shiftStartedAt: new Date() },
+    });
+    const operator = await this.prisma.user.findUniqueOrThrow({
+      where: { id: operatorId },
       select: { onShift: true, shiftStartedAt: true },
     });
 
@@ -162,22 +173,31 @@ export class DispatchService {
   }
 
   async endShift(operatorId: string) {
-    const activeSessionCount = await this.countOpenAssigned(operatorId);
-    if (activeSessionCount > 0) {
-      throw new ConflictException(
-        `Нельзя сдать смену: у вас ${activeSessionCount} незакрытых вызовов. ` +
-          'Закройте их или попросите администратора переназначить.',
+    // Условие «нет открытых вызовов» живёт в самом запросе: между отдельной
+    // проверкой и обновлением админ успевал назначить вызов, и оператор уходил
+    // со смены с висящим на нём выездом.
+    const { count } = await this.prisma.user.updateMany({
+      where: {
+        id: operatorId,
+        assignedSessions: {
+          none: { status: { in: OPEN_ASSIGNED_STATUSES } },
+        },
+      },
+      data: { onShift: false, shiftStartedAt: null },
+    });
+
+    if (count === 0) {
+      const activeSessionCount = await this.countOpenAssigned(operatorId);
+      throw conflict(
+        ErrorCode.SHIFT_HAS_OPEN_SESSIONS,
+        `Cannot end shift: ${activeSessionCount} open session(s)`,
+        { openSessions: activeSessionCount },
       );
     }
 
-    const operator = await this.prisma.user.update({
-      where: { id: operatorId },
-      data: { onShift: false, shiftStartedAt: null },
-      select: { onShift: true, shiftStartedAt: true },
-    });
     await this.wsGateway.setOperatorShiftRoom(operatorId, false);
 
-    return { ...operator, activeSessionCount: 0 };
+    return { onShift: false, shiftStartedAt: null, activeSessionCount: 0 };
   }
 
   /**
@@ -185,11 +205,16 @@ export class DispatchService {
    * exactly what makes a session visible to them.
    */
   async getPool(operatorId: string, page: number, limit: number) {
-    const operator = await this.prisma.user.findUnique({
-      where: { id: operatorId },
-      select: { onShift: true },
-    });
-    if (!operator?.onShift) {
+    const [operator, openAssigned] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: operatorId },
+        select: { onShift: true },
+      }),
+      this.countOpenAssigned(operatorId),
+    ]);
+    // Вне смены вызовы не приходят, а с незакрытым своим — не предлагаются:
+    // оператор ведёт один вызов за раз.
+    if (!operator?.onShift || openAssigned > 0) {
       return { data: [], total: 0, page, limit };
     }
 
@@ -220,13 +245,24 @@ export class DispatchService {
    * gets P2025 rather than silently stealing an already-claimed session.
    */
   async acceptSession(sessionId: string, operatorId: string) {
-    const operator = await this.prisma.user.findUnique({
-      where: { id: operatorId },
-      select: { onShift: true },
-    });
+    const [operator, openAssigned] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: operatorId },
+        select: { onShift: true },
+      }),
+      this.countOpenAssigned(operatorId),
+    ]);
     if (!operator?.onShift) {
-      throw new ForbiddenException(
-        'Заступите на смену, чтобы принимать вызовы',
+      throw forbidden(
+        ErrorCode.NOT_ON_SHIFT,
+        'Operator must be on shift to accept calls',
+      );
+    }
+    if (openAssigned > 0) {
+      throw conflict(
+        ErrorCode.OPERATOR_BUSY,
+        `Operator already has ${openAssigned} open session(s)`,
+        { openSessions: openAssigned },
       );
     }
 
@@ -244,12 +280,13 @@ export class DispatchService {
         include: OPERATOR_SESSION_INCLUDE,
       });
 
-      // Same event admin-driven assignment emits: other operators drop it from
-      // their pool because the status is no longer NEW.
       this.wsGateway.emitEmergencyAssigned(
         updated.userId,
         updated as unknown as Record<string, unknown>,
       );
+      // Остальным дежурным — только идентификатор: им нужно убрать карточку из
+      // пула, а не получить данные заявителя.
+      this.wsGateway.emitPoolRemoved(sessionId);
       return updated;
     } catch (err) {
       if (!isPrismaRowNotFound(err)) throw err;
@@ -257,11 +294,18 @@ export class DispatchService {
         where: { id: sessionId },
         select: { status: true, assignedOperatorId: true },
       });
-      if (!existing) throw new NotFoundException('Session not found');
+      if (!existing) throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
       if (existing.assignedOperatorId) {
-        throw new ConflictException('Вызов уже принят другим оператором');
+        throw conflict(
+          ErrorCode.SESSION_ALREADY_CLAIMED,
+          'Session was claimed by another operator',
+        );
       }
-      throw new ConflictException(`Session is ${existing.status}`);
+      throw conflict(
+        ErrorCode.SESSION_WRONG_STATUS,
+        `Session is ${existing.status}`,
+        { status: existing.status },
+      );
     }
   }
 

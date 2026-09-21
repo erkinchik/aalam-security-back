@@ -38,12 +38,12 @@ export class EmergencyController {
 
   @Get('active')
   @Roles(Role.OPERATOR)
-  @ApiOperation({ summary: 'List active emergency sessions for operator orgs' })
+  @ApiOperation({ summary: 'Sessions assigned to the current operator' })
   getActive(
     @CurrentUser() user: { id: string },
     @Query() query: PaginationQueryDto,
   ) {
-    return this.emergencyService.getActiveSessions(
+    return this.emergencyService.getMyAssignedSessions(
       user.id,
       query.page ?? 1,
       query.limit ?? 20,
@@ -82,5 +82,13 @@ export class EmergencyController {
   @ApiOperation({ summary: 'Close an emergency session' })
   close(@Param('id') id: string, @CurrentUser() user: { id: string }) {
     return this.emergencyService.closeSession(id, user.id);
+  }
+
+  // Объявлен последним: иначе ':id' перехватил бы /emergency/history.
+  @Get(':id')
+  @Roles(Role.OPERATOR)
+  @ApiOperation({ summary: 'Get one session assigned to the current operator' })
+  getOne(@Param('id') id: string, @CurrentUser() user: { id: string }) {
+    return this.emergencyService.getOperatorSession(id, user.id);
   }
 }

@@ -1,7 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { OPEN_ASSIGNED_STATUSES } from '../../common/constants/operator-presence';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+/** Expo принимает не больше 100 сообщений за запрос. */
+const EXPO_BATCH_SIZE = 100;
+/** Без таймаута зависший запрос держал бы обработчик до бесконечности. */
+const EXPO_TIMEOUT_MS = 10_000;
 
 // Expo per-message ticket shape we care about.
 type ExpoTicket = {
@@ -46,12 +51,52 @@ export class PushService {
   }
 
   /**
+   * Отправка в Expo: нарезка по 100 и таймаут. Раньше каждый из трёх вызовов
+   * повторял один и тот же блок, при этом список длиннее сотни Expo отверг бы
+   * целиком — и push не ушёл бы никому.
+   */
+  private async postToExpo(
+    messages: Record<string, unknown>[],
+    tokens: string[],
+    context: string,
+  ) {
+    for (let i = 0; i < messages.length; i += EXPO_BATCH_SIZE) {
+      const batch = messages.slice(i, i + EXPO_BATCH_SIZE);
+      const batchTokens = tokens.slice(i, i + EXPO_BATCH_SIZE);
+      try {
+        const res = await fetch(EXPO_PUSH_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(batch),
+          signal: AbortSignal.timeout(EXPO_TIMEOUT_MS),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          this.logger.error(`Expo API error ${res.status} (${context}): ${text}`);
+          continue;
+        }
+        const json = await res.json();
+        await this.clearDeadTokens(batchTokens, json);
+      } catch (err) {
+        this.logger.error(`Failed to send push (${context})`, err as Error);
+      }
+    }
+  }
+
+  /**
    * Broadcast a fresh SOS to every operator on shift. Operators are a global
    * pool — they are deliberately not scoped to the raising organization.
    */
   async sendSosAlert(sessionId: string) {
+    // Занятому оператору push не шлём: принять он всё равно не сможет, а
+    // разбудит его посреди собственного выезда.
     const operators = await this.prisma.user.findMany({
-      where: { role: 'OPERATOR', onShift: true, pushToken: { not: null } },
+      where: {
+        role: 'OPERATOR',
+        onShift: true,
+        pushToken: { not: null },
+        assignedSessions: { none: { status: { in: OPEN_ASSIGNED_STATUSES } } },
+      },
       select: { pushToken: true },
     });
 
@@ -75,22 +120,7 @@ export class PushService {
       priority: 'high',
     }));
 
-    try {
-      const res = await fetch(EXPO_PUSH_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(messages),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        this.logger.error(`Expo API error ${res.status}: ${text}`);
-        return;
-      }
-      const json = await res.json();
-      await this.clearDeadTokens(tokens, json);
-    } catch (err) {
-      this.logger.error('Failed to send SOS push', err as Error);
-    }
+    await this.postToExpo(messages, tokens, 'SOS alert');
   }
 
   async sendSubscriptionDecision(
@@ -132,22 +162,7 @@ export class PushService {
       },
     ];
 
-    try {
-      const res = await fetch(EXPO_PUSH_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(messages),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        this.logger.error(`Expo API error ${res.status}: ${text}`);
-        return;
-      }
-      const json = await res.json();
-      await this.clearDeadTokens(tokens, json);
-    } catch (err) {
-      this.logger.error('Failed to send subscription decision push', err as Error);
-    }
+    await this.postToExpo(messages, tokens, 'subscription decision');
   }
 
   async sendAssignmentToOperator(sessionId: string, operatorId: string) {
@@ -171,21 +186,6 @@ export class PushService {
       },
     ];
 
-    try {
-      const res = await fetch(EXPO_PUSH_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(messages),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        this.logger.error(`Expo API error ${res.status}: ${text}`);
-        return;
-      }
-      const json = await res.json();
-      await this.clearDeadTokens(tokens, json);
-    } catch (err) {
-      this.logger.error('Failed to send assignment push', err as Error);
-    }
+    await this.postToExpo(messages, tokens, 'assignment');
   }
 }
