@@ -205,7 +205,12 @@ export class WebsocketGateway
             })
           : [];
 
-      client.emit('emergency:bootstrap', { sessions: [...mine, ...pool] });
+      // onShift — чтобы клиент, пропустивший operator:shift_ended, узнал о снятой
+      // смене при первом же переподключении, а не продолжал ждать вызовов.
+      client.emit('emergency:bootstrap', {
+        sessions: [...mine, ...pool],
+        onShift: Boolean(operator?.onShift),
+      });
     } catch (err) {
       this.logger.error(
         'Failed to send operator bootstrap snapshot',

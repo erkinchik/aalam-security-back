@@ -888,6 +888,16 @@ test('WS: новый SOS уходит админу и дежурному, но �
     onShift.events.some((e) => e.name === 'emergency:bootstrap'),
   );
   assert.ok(gotBootstrap, 'оператор обязан получить emergency:bootstrap');
+  // Смена в снимке: клиент, пропустивший operator:shift_ended, узнаёт о ней
+  // при переподключении.
+  const bootOn = onShift.events.find((e) => e.name === 'emergency:bootstrap');
+  assert.equal(bootOn.payload.onShift, true, 'снимок дежурного обязан нести onShift=true');
+  const gotOffBootstrap = await waitFor(() =>
+    offShift.events.some((e) => e.name === 'emergency:bootstrap'),
+  );
+  assert.ok(gotOffBootstrap, 'оператор вне смены тоже получает снимок своих вызовов');
+  const bootOff = offShift.events.find((e) => e.name === 'emergency:bootstrap');
+  assert.equal(bootOff.payload.onShift, false, 'снимок вне смены обязан нести onShift=false');
 
   const u = await makeSubscribedUser('ws1');
   const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
