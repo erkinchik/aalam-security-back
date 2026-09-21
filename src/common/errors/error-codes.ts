@@ -1,0 +1,44 @@
+/**
+ * Машинные коды ошибок. Клиент по коду выбирает текст из своей локали, поэтому
+ * сообщения на сервере остаются английскими — они для логов и Sentry, а не для
+ * пользователя.
+ *
+ * Код добавляется в тело ответа полем `code` (см. HttpExceptionFilter). Клиент,
+ * не знающий кода, падает на серверный `message`, так что вводить коды можно
+ * по частям.
+ */
+export const ErrorCode = {
+  // Вызовы
+  SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
+  SESSION_ALREADY_CLOSED: 'SESSION_ALREADY_CLOSED',
+  SESSION_ALREADY_CLAIMED: 'SESSION_ALREADY_CLAIMED',
+  SESSION_WRONG_STATUS: 'SESSION_WRONG_STATUS',
+  NOT_YOUR_SESSION: 'NOT_YOUR_SESSION',
+  NOT_ASSIGNED_TO_SESSION: 'NOT_ASSIGNED_TO_SESSION',
+  SOS_IN_PROGRESS: 'SOS_IN_PROGRESS',
+
+  // Смена и операторы
+  NOT_ON_SHIFT: 'NOT_ON_SHIFT',
+  OPERATOR_BUSY: 'OPERATOR_BUSY',
+  SHIFT_HAS_OPEN_SESSIONS: 'SHIFT_HAS_OPEN_SESSIONS',
+  NOT_AN_OPERATOR: 'NOT_AN_OPERATOR',
+  OPERATOR_NOT_FOUND: 'OPERATOR_NOT_FOUND',
+
+  // Доступ к SOS
+  SUBSCRIPTION_REQUIRED: 'SUBSCRIPTION_REQUIRED',
+  SUBSCRIPTION_EXPIRED: 'SUBSCRIPTION_EXPIRED',
+  VENUE_BIND_REQUIRED: 'VENUE_BIND_REQUIRED',
+  VENUE_NOT_FOUND: 'VENUE_NOT_FOUND',
+
+  // Учётная запись
+  DEMO_DISABLED: 'DEMO_DISABLED',
+  PASSWORD_RESET_UNAVAILABLE: 'PASSWORD_RESET_UNAVAILABLE',
+  EMAIL_ALREADY_REGISTERED: 'EMAIL_ALREADY_REGISTERED',
+  INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
+  STAFF_CANNOT_SELF_DELETE: 'STAFF_CANNOT_SELF_DELETE',
+  ACTIVE_SOS_BLOCKS_DELETE: 'ACTIVE_SOS_BLOCKS_DELETE',
+  TELEGRAM_ALREADY_LINKED: 'TELEGRAM_ALREADY_LINKED',
+  PHONE_MISMATCH: 'PHONE_MISMATCH',
+} as const;
+
+export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

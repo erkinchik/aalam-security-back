@@ -15,7 +15,9 @@ const HTTP_STATUS_MESSAGES: Record<number, string> = {
   [HttpStatus.FORBIDDEN]: 'Forbidden',
   [HttpStatus.NOT_FOUND]: 'Not Found',
   [HttpStatus.CONFLICT]: 'Conflict',
+  [HttpStatus.TOO_MANY_REQUESTS]: 'Too Many Requests',
   [HttpStatus.INTERNAL_SERVER_ERROR]: 'Internal Server Error',
+  [HttpStatus.SERVICE_UNAVAILABLE]: 'Service Unavailable',
 };
 
 @Catch()
@@ -49,6 +51,23 @@ export class HttpExceptionFilter implements ExceptionFilter {
     }
 
     const { message, errors } = this.normalizeResponse(rawResponse, status);
+    // Машинный код, если исключение его принесло (AppException). Клиент по нему
+    // выбирает текст из своей локали; без кода остаётся серверный message.
+    const code =
+      typeof rawResponse === 'object' &&
+      rawResponse !== null &&
+      'code' in rawResponse &&
+      typeof (rawResponse as Record<string, unknown>).code === 'string'
+        ? ((rawResponse as Record<string, unknown>).code as string)
+        : undefined;
+    const details =
+      typeof rawResponse === 'object' && rawResponse !== null
+        ? Object.fromEntries(
+            Object.entries(rawResponse as Record<string, unknown>).filter(
+              ([key]) => !['code', 'message', 'error', 'statusCode'].includes(key),
+            ),
+          )
+        : {};
     const errorLabel =
       typeof rawResponse === 'object' &&
       rawResponse !== null &&
@@ -60,8 +79,10 @@ export class HttpExceptionFilter implements ExceptionFilter {
     response.status(status).json({
       statusCode: status,
       error: errorLabel,
+      ...(code && { code }),
       message,
       ...(errors && errors.length > 0 && { errors }),
+      ...details,
       timestamp: new Date().toISOString(),
       path: request.url,
     });
