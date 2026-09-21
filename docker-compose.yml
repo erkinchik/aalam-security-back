@@ -50,6 +50,12 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ВАЖНО: ровно один экземпляр. Socket.IO работает без redis-адаптера, поэтому
+  # комнаты, fetchSockets и socketsJoin действуют только внутри своего процесса:
+  # вторая реплика не получит рассылку вызовов, а cron решит, что операторы
+  # соседнего узла мертвы, и снимет их со смены. Throttler тоже держит счётчики
+  # в памяти. Перед масштабированием — @socket.io/redis-adapter и Redis-хранилище
+  # throttler'а (см. TASKS.md, B2 и п. 15).
   api:
     build:
       context: .
@@ -60,6 +66,7 @@ services:
     env_file:
       - .env
     deploy:
+      replicas: 1
       resources:
         limits:
           cpus: '0.8'
