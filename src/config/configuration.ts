@@ -26,11 +26,28 @@ export const validationSchema = Joi.object({
   REDIS_PASSWORD: Joi.string().optional().allow(''),
 
   JWT_ACCESS_SECRET: Joi.string().min(32).required(),
-  JWT_REFRESH_SECRET: Joi.string().min(32).required(),
+  // Совпадение секретов означало бы, что access-токен проходит проверку как
+  // refresh: пятнадцатиминутный доступ превратился бы в семидневный.
+  JWT_REFRESH_SECRET: Joi.string()
+    .min(32)
+    .required()
+    .invalid(Joi.ref('JWT_ACCESS_SECRET'))
+    .messages({
+      'any.invalid': 'JWT_REFRESH_SECRET must differ from JWT_ACCESS_SECRET',
+    }),
   JWT_ACCESS_EXPIRES: Joi.string().default('15m'),
   JWT_REFRESH_EXPIRES: Joi.string().default('7d'),
 
+  // Нужен для ссылок в письмах. Без него восстановление пароля не включается.
   APP_URL: Joi.string().uri().optional(),
+
+  // SMTP любого провайдера с бесплатным тарифом (Brevo, Resend, Яндекс 360).
+  // Пусто — исходящая почта выключена, и сервер честно об этом отвечает.
+  SMTP_HOST: Joi.string().optional().allow(''),
+  SMTP_PORT: Joi.number().default(587),
+  SMTP_USER: Joi.string().optional().allow(''),
+  SMTP_PASSWORD: Joi.string().optional().allow(''),
+  MAIL_FROM: Joi.string().optional().allow(''),
 
   // Allow `prisma db seed` to run when NODE_ENV=production.
   // Only set when you intentionally want to seed a prod database.
@@ -93,7 +110,9 @@ export default () => ({
   },
   metricsToken: process.env.METRICS_TOKEN || undefined,
   app: {
-    url: process.env.APP_URL || 'https://app.sos-security.com',
+    // Дефолт указывал на несуществующий app.sos-security.com. Ссылки из писем
+    // вели бы в никуда, поэтому адрес задаётся только через APP_URL.
+    url: process.env.APP_URL,
   },
   database: {
     url: process.env.DATABASE_URL,
@@ -115,6 +134,13 @@ export default () => ({
       process.env.JWT_REFRESH_EXPIRES || '7d',
       7 * 86400,
     ),
+  },
+  mail: {
+    host: process.env.SMTP_HOST || undefined,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    user: process.env.SMTP_USER || undefined,
+    password: process.env.SMTP_PASSWORD || undefined,
+    from: process.env.MAIL_FROM || undefined,
   },
   telegram: {
     botSecret: process.env.TELEGRAM_BOT_SECRET,

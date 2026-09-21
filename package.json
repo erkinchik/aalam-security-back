@@ -11,7 +11,7 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
     "prisma:migrate:dev": "prisma migrate dev",
-    "test:e2e": "node --test --test-reporter=spec test/e2e.mjs"
+    "test:e2e": "node --env-file=.env --test --test-reporter=spec test/e2e.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.0",
@@ -36,6 +36,7 @@
     "ioredis": "^5.4.1",
     "joi": "^17.13.0",
     "nestjs-pino": "^4.6.1",
+    "nodemailer": "^10.0.10",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "pino": "^10.3.1",
@@ -52,6 +53,7 @@
     "@types/bcryptjs": "^2.4.6",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
+    "@types/nodemailer": "^8.0.1",
     "@types/passport-jwt": "^4.0.1",
     "prisma": "^5.18.0",
     "ts-node": "^10.9.2",
