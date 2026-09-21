@@ -4,14 +4,18 @@ import { Role } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
+import { RefreshTokenService } from '../refresh-token/refresh-token.service';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 import {
-  ONLINE_THRESHOLD_MS,
+  RECLAIM_ASSIGNMENT_THRESHOLD_MS,
   SHIFT_ALIVE_THRESHOLD_MS,
   isHeartbeatFresh,
 } from '../../common/constants/operator-presence';
+import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
 
 const STALE_LOCK_KEY = 'cron:stale-assignments';
+const SUBSCRIPTION_LOCK_KEY = 'cron:expire-subscriptions';
+const SUBSCRIPTION_LOCK_TTL_SECONDS = 300;
 // Lock TTL just longer than the schedule (30s) so a hanging worker doesn't
 // block the next tick indefinitely, but still prevents two workers from
 // colliding when scaled horizontally.
@@ -25,20 +29,29 @@ export class CronService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly wsGateway: WebsocketGateway,
+    private readonly refreshTokens: RefreshTokenService,
   ) {}
 
   @Cron(CronExpression.EVERY_30_SECONDS)
   async checkStaleAssignments() {
     // REL-3: distributed lock so we're safe under horizontal scale.
-    const acquired = await this.redis
-      .getClient()
-      .set(STALE_LOCK_KEY, '1', 'EX', STALE_LOCK_TTL_SECONDS, 'NX');
-    if (!acquired) {
+    const lockToken = await this.redis
+      .acquireLock(STALE_LOCK_KEY, STALE_LOCK_TTL_SECONDS)
+      .catch((err: unknown) => {
+        this.logger.error('Redis unavailable for stale-assignment lock', err as Error);
+        return null;
+      });
+    if (!lockToken) {
       this.logger.debug('Stale-assignment lock held by another worker, skipping');
       return;
     }
 
     try {
+      // Открытый сокет — тоже признак жизни. HTTP-пинг замирает, как только
+      // телефон уходит в фон или гаснет экран, и оператор слетал со смены,
+      // продолжая при этом видеть интерфейс дежурного.
+      await this.refreshPresenceFromSockets();
+
       const staleSessions = await this.prisma.emergencySession.findMany({
         where: {
           status: { in: ['ASSIGNED', 'IN_PROGRESS'] },
@@ -54,9 +67,11 @@ export class CronService {
           const heartbeat = await this.redis.getOperatorHeartbeat(
             session.assignedOperatorId!,
           );
-          // The heartbeat key outlives the online window (it also backs the
-          // shift check), so compare the timestamp rather than mere existence.
-          if (isHeartbeatFresh(heartbeat, ONLINE_THRESHOLD_MS)) continue;
+          // Ключ heartbeat живёт дольше любого порога, поэтому сравниваем
+          // отметку времени, а не факт существования.
+          if (isHeartbeatFresh(heartbeat, RECLAIM_ASSIGNMENT_THRESHOLD_MS)) {
+            continue;
+          }
 
           this.logger.warn(
             `Operator ${session.assignedOperatorId} offline. Reassigning session ${session.id}`,
@@ -75,12 +90,16 @@ export class CronService {
                 status: 'NEW',
                 assignedOperatorId: null,
               },
-              include: {
-                user: { select: { id: true, email: true, role: true } },
-              },
+              // Полный include: вызов возвращается в пул, и карточка предложения
+              // у дежурных должна отрисоваться так же, как у свежего SOS.
+              include: OPERATOR_SESSION_INCLUDE,
             });
 
             this.wsGateway.emitEmergencyReassigned(
+              updated as unknown as Record<string, unknown>,
+              session.assignedOperatorId,
+            );
+            void this.wsGateway.emitPoolReturned(
               updated as unknown as Record<string, unknown>,
             );
           } catch (updateErr) {
@@ -103,7 +122,21 @@ export class CronService {
       // Sessions are freed first: dropping the shift of an operator who still
       // held calls would leave those calls stranded.
       await this.dropDeadShifts();
-      await this.redis.getClient().del(STALE_LOCK_KEY);
+      await this.redis
+        .releaseLock(STALE_LOCK_KEY, lockToken)
+        .catch((err: unknown) =>
+          this.logger.error('Failed to release stale-assignment lock', err as Error),
+        );
+    }
+  }
+
+  /** Продлевает присутствие всем дежурным, у кого сейчас живой сокет. */
+  private async refreshPresenceFromSockets() {
+    try {
+      const ids = await this.wsGateway.getConnectedOnShiftOperatorIds();
+      await Promise.all(ids.map((id) => this.redis.setOperatorHeartbeat(id)));
+    } catch (error) {
+      this.logger.error('Failed to refresh presence from sockets', error as Error);
     }
   }
 
@@ -137,13 +170,65 @@ export class CronService {
         data: { onShift: false, shiftStartedAt: null },
       });
       await Promise.all(
-        dead.map((id) => this.wsGateway.setOperatorShiftRoom(id, false)),
+        dead.map(async (id) => {
+          // Событие уходит до выхода из комнаты — иначе оно не дойдёт.
+          this.wsGateway.emitShiftEnded(id, 'inactivity');
+          await this.wsGateway.setOperatorShiftRoom(id, false);
+        }),
       );
       this.logger.warn(
         `Ended shift for ${dead.length} unreachable operator(s): ${dead.join(', ')}`,
       );
     } catch (error) {
       this.logger.error('Failed to drop dead operator shifts', error as Error);
+    }
+  }
+
+  /**
+   * Просроченные refresh-токены в базе сами не исчезают, в отличие от ключей
+   * Redis с TTL. Раз в час подчищаем, иначе таблица растёт бесконечно.
+   */
+  @Cron(CronExpression.EVERY_HOUR)
+  async cleanupRefreshTokens() {
+    try {
+      await this.refreshTokens.removeExpired();
+    } catch (error) {
+      this.logger.error('Failed to clean up expired refresh tokens', error as Error);
+    }
+  }
+
+  /**
+   * Гасит флаг подписки, когда её срок истёк. Проверка при старте SOS и так
+   * смотрит на дату, но без этой задачи в базе копятся пользователи, формально
+   * числящиеся подписчиками: их видно в админке и в /users/me как активных.
+   */
+  @Cron(CronExpression.EVERY_HOUR)
+  async expireSubscriptions() {
+    const lockToken = await this.redis
+      .acquireLock(SUBSCRIPTION_LOCK_KEY, SUBSCRIPTION_LOCK_TTL_SECONDS)
+      .catch((err: unknown) => {
+        this.logger.error('Redis unavailable for subscription lock', err as Error);
+        return null;
+      });
+    if (!lockToken) return;
+
+    try {
+      const { count } = await this.prisma.user.updateMany({
+        where: {
+          individualSubscriptionActive: true,
+          subscriptionExpiresAt: { not: null, lt: new Date() },
+        },
+        data: { individualSubscriptionActive: false },
+      });
+      if (count > 0) {
+        this.logger.log(`Expired ${count} individual subscription(s)`);
+      }
+    } catch (error) {
+      this.logger.error('Failed to expire subscriptions', error as Error);
+    } finally {
+      await this.redis
+        .releaseLock(SUBSCRIPTION_LOCK_KEY, lockToken)
+        .catch(() => undefined);
     }
   }
 }

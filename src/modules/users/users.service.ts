@@ -1,18 +1,18 @@
 import {
-  ConflictException,
-  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { EmergencyStatus, Prisma, Role } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
-import { RedisService } from '../../redis/redis.service';
+import { RefreshTokenService } from '../refresh-token/refresh-token.service';
 import { UpdateUserMeDto } from './dto/update-user-me.dto';
-
-const ANONYMIZE_EMAIL_DOMAIN = 'deleted.local';
+import { ErrorCode } from '../../common/errors/error-codes';
+import { conflict, forbidden } from '../../common/errors/app.exception';
+import { anonymizedEmailFor } from '../../common/constants/anonymize';
 
 @Injectable()
 export class UsersService {
@@ -20,7 +20,8 @@ export class UsersService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly redis: RedisService,
+    private readonly config: ConfigService,
+    private readonly refreshTokens: RefreshTokenService,
   ) {}
 
   async findMe(userId: string) {
@@ -68,8 +69,19 @@ export class UsersService {
     return this.findMe(userId);
   }
 
-  /** Demo / pre-payment: not exposed on generic PATCH /users/me. Replace with webhook-driven updates. */
+  /**
+   * Демо-активация подписки. В проде закрыта: иначе любой, кто зарегистрировался,
+   * одним запросом выдаёт себе платный доступ. Настоящая активация приходит от
+   * биллинга через админский разбор заявки (admin.approveSubscriptionRequest).
+   */
   async activateDemoIndividualSubscription(userId: string) {
+    if (this.config.get<string>('nodeEnv') === 'production') {
+      throw forbidden(
+        ErrorCode.DEMO_DISABLED,
+        'Demo subscription activation is disabled in production',
+      );
+    }
+
     await this.prisma.user.update({
       where: { id: userId },
       data: { individualSubscriptionActive: true },
@@ -77,13 +89,25 @@ export class UsersService {
     return this.findMe(userId);
   }
 
+  /**
+   * Один физический телефон — один владелец токена. Поле не уникально, поэтому
+   * без явной чистки после смены оператора на устройстве токен оставался бы
+   * сразу у двоих, и SOS приходил бы за обоих.
+   */
   async registerPushToken(userId: string, pushToken: string) {
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { pushToken },
-    });
+    await this.prisma.$transaction([
+      this.prisma.user.updateMany({
+        where: { pushToken, NOT: { id: userId } },
+        data: { pushToken: null },
+      }),
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { pushToken },
+      }),
+    ]);
     return { status: 'ok' };
   }
+
 
   /**
    * Apple Guideline 5.1.1(v): self-service account deletion. Anonymize rather
@@ -110,8 +134,9 @@ export class UsersService {
       return { status: 'ok' };
     }
     if (user.role !== Role.USER) {
-      throw new ForbiddenException(
-        'Сотрудники и администраторы не могут удалить учётную запись самостоятельно. Обратитесь к администратору.',
+      throw forbidden(
+        ErrorCode.STAFF_CANNOT_SELF_DELETE,
+        'Staff and admins cannot delete their own account',
       );
     }
 
@@ -129,12 +154,13 @@ export class UsersService {
       select: { id: true },
     });
     if (activeEmergency) {
-      throw new ConflictException(
-        'У вас есть активный SOS-вызов. Дождитесь его завершения и попробуйте снова.',
+      throw conflict(
+        ErrorCode.ACTIVE_SOS_BLOCKS_DELETE,
+        'Account has an active SOS session',
       );
     }
 
-    const anonymizedEmail = `deleted_${userId}@${ANONYMIZE_EMAIL_DOMAIN}`;
+    const anonymizedEmail = anonymizedEmailFor(userId);
     const randomPassword = await bcrypt.hash(
       crypto.randomBytes(32).toString('hex'),
       10,
@@ -175,7 +201,7 @@ export class UsersService {
 
     // Revoke every refresh token so existing sessions can't be refreshed.
     // Access tokens (15 min) will die on their own.
-    await this.redis.removeAllRefreshTokens(userId);
+    await this.refreshTokens.removeAllForUser(userId);
 
     this.logger.log(`User ${userId} self-deleted account at ${now.toISOString()}`);
     return { status: 'ok' };

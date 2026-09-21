@@ -1,11 +1,25 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
 import Redis from 'ioredis';
 import { HEARTBEAT_TTL_SECONDS } from '../common/constants/operator-presence';
+
+/**
+ * Снимаем лок только если он всё ещё наш. Безусловный DEL удалял чужой лок,
+ * если работа затянулась дольше TTL и ключ успел перехватить другой процесс.
+ */
+const RELEASE_LOCK_SCRIPT = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+`;
 
 @Injectable()
 export class RedisService implements OnModuleDestroy {
   private readonly client: Redis;
+
+  private readonly logger = new Logger(RedisService.name);
 
   constructor(private readonly configService: ConfigService) {
     const password = this.configService.get<string>('redis.password');
@@ -14,18 +28,31 @@ export class RedisService implements OnModuleDestroy {
       port: this.configService.get<number>('redis.port'),
       password: password && password.length > 0 ? password : undefined,
     });
+    // Без слушателя ioredis отдаёт ошибку соединения как необработанное событие
+    // 'error' — процесс падает вместо того, чтобы деградировать.
+    this.client.on('error', (err) => {
+      this.logger.error(`Redis connection error: ${err.message}`);
+    });
   }
 
   getClient(): Redis {
     return this.client;
   }
 
-  async addActiveEmergency(sessionId: string): Promise<void> {
-    await this.client.sadd('active_emergencies', sessionId);
+  /**
+   * Берёт распределённый лок. Возвращает токен владельца или null, если ключ
+   * занят. Ошибку соединения не глотает — вызывающий решает сам, критично ли
+   * отсутствие лока для его сценария.
+   */
+  async acquireLock(key: string, ttlSeconds: number): Promise<string | null> {
+    const token = crypto.randomUUID();
+    const ok = await this.client.set(key, token, 'EX', ttlSeconds, 'NX');
+    return ok ? token : null;
   }
 
-  async removeActiveEmergency(sessionId: string): Promise<void> {
-    await this.client.srem('active_emergencies', sessionId);
+  /** Снимает лок, если он всё ещё принадлежит этому токену. */
+  async releaseLock(key: string, token: string): Promise<void> {
+    await this.client.eval(RELEASE_LOCK_SCRIPT, 1, key, token);
   }
 
   async setOperatorHeartbeat(operatorId: string): Promise<void> {
@@ -63,26 +90,6 @@ export class RedisService implements OnModuleDestroy {
     return result;
   }
 
-  async storeRefreshToken(
-    userId: string,
-    token: string,
-    ttlSeconds: number,
-  ): Promise<void> {
-    await this.client.set(`refresh:${userId}:${token}`, '1', 'EX', ttlSeconds);
-  }
-
-  async isRefreshTokenValid(
-    userId: string,
-    token: string,
-  ): Promise<boolean> {
-    const result = await this.client.exists(`refresh:${userId}:${token}`);
-    return result === 1;
-  }
-
-  async removeRefreshToken(userId: string, token: string): Promise<void> {
-    await this.client.del(`refresh:${userId}:${token}`);
-  }
-
   async setPhoneVerificationToken(
     token: string,
     userId: string,
@@ -97,28 +104,6 @@ export class RedisService implements OnModuleDestroy {
 
   async deletePhoneVerificationToken(token: string): Promise<void> {
     await this.client.del(`phone-verify:${token}`);
-  }
-
-  /**
-   * Wipe every refresh token belonging to a user — used as the reaction to
-   * detected reuse (SEC-12). Uses SCAN to avoid blocking Redis on large sets.
-   */
-  async removeAllRefreshTokens(userId: string): Promise<void> {
-    const pattern = `refresh:${userId}:*`;
-    let cursor = '0';
-    do {
-      const [next, keys] = await this.client.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        100,
-      );
-      cursor = next;
-      if (keys.length > 0) {
-        await this.client.del(...keys);
-      }
-    } while (cursor !== '0');
   }
 
   async onModuleDestroy() {

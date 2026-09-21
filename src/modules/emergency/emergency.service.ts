@@ -1,10 +1,5 @@
-import {
-  Injectable,
-  ConflictException,
-  NotFoundException,
-  ForbiddenException,
-} from '@nestjs/common';
-import { EmergencyType, OrganizationType, OrgMemberRole } from '@prisma/client';
+import { Injectable, Logger } from '@nestjs/common';
+import { EmergencyType, OrgMemberRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
@@ -12,6 +7,13 @@ import { OrganizationService } from '../organization/organization.service';
 import { PushService } from '../push/push.service';
 import { CreateLocationDto } from './dto/create-location.dto';
 import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
+import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
+import { ErrorCode } from '../../common/errors/error-codes';
+import {
+  conflict,
+  forbidden,
+  notFound,
+} from '../../common/errors/app.exception';
 
 // REL-2: hold a Redis lock for this long to suppress concurrent SOS triggers
 // from the same user. 30 s is enough to cover normal request latency / retries.
@@ -19,6 +21,8 @@ const SOS_TRIGGER_LOCK_TTL_SECONDS = 30;
 
 @Injectable()
 export class EmergencyService {
+  private readonly logger = new Logger(EmergencyService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -27,16 +31,32 @@ export class EmergencyService {
     private readonly pushService: PushService,
   ) {}
 
+  /**
+   * REL-2: лок гасит дубли от повторных нажатий и ретраев одного пользователя.
+   *
+   * Недоступность Redis не должна отменять тревогу — это единственная функция
+   * продукта. Поэтому сбой лока логируется и мы идём дальше без него: защита от
+   * дублей деградирует, вызов проходит. На повторную сессию всё равно есть
+   * проверка в `startSessionLocked`, она читает базу.
+   */
   async startSession(userId: string, venueId?: string) {
-    // REL-2: prevent SOS spam from a single user across concurrent retries.
-    // Held only around the read-then-create critical section.
     const lockKey = `sos:trigger:${userId}`;
-    const acquired = await this.redis
-      .getClient()
-      .set(lockKey, '1', 'EX', SOS_TRIGGER_LOCK_TTL_SECONDS, 'NX');
-    if (!acquired) {
-      // Another concurrent trigger is in flight; return the active session if
-      // it's already been written, otherwise tell the client to back off.
+    let token: string | null = null;
+    let lockAvailable = true;
+
+    try {
+      token = await this.redis.acquireLock(lockKey, SOS_TRIGGER_LOCK_TTL_SECONDS);
+    } catch (err) {
+      lockAvailable = false;
+      this.logger.error(
+        'Redis unavailable for SOS trigger lock; proceeding without duplicate protection',
+        err as Error,
+      );
+    }
+
+    if (lockAvailable && !token) {
+      // Параллельный запуск уже в работе: отдаём активную сессию, если она
+      // успела записаться, иначе просим клиента подождать.
       const inFlight = await this.prisma.emergencySession.findFirst({
         where: { userId, status: { not: 'CLOSED' } },
         include: {
@@ -45,13 +65,23 @@ export class EmergencyService {
         },
       });
       if (inFlight) return inFlight;
-      throw new ConflictException('SOS request is already being processed');
+      throw conflict(
+        ErrorCode.SOS_IN_PROGRESS,
+        'SOS request is already being processed',
+      );
     }
 
     try {
       return await this.startSessionLocked(userId, venueId);
     } finally {
-      await this.redis.getClient().del(lockKey);
+      if (token) {
+        // Снятие лока не должно превращать успешный SOS в 500.
+        await this.redis
+          .releaseLock(lockKey, token)
+          .catch((err: unknown) =>
+            this.logger.error('Failed to release SOS trigger lock', err as Error),
+          );
+      }
     }
   }
 
@@ -78,7 +108,7 @@ export class EmergencyService {
         include: { organization: true },
       });
       if (!venue) {
-        throw new NotFoundException('Venue not found');
+        throw notFound(ErrorCode.VENUE_NOT_FOUND, 'Venue not found');
       }
 
       const membership = await this.prisma.organizationMember.findFirst({
@@ -99,10 +129,7 @@ export class EmergencyService {
             role: { in: [OrgMemberRole.MEMBER, OrgMemberRole.MANAGER] },
           },
         });
-        if (
-          orgWideMember &&
-          venue.organization.type === OrganizationType.BUSINESS
-        ) {
+        if (orgWideMember) {
           organizationId = venue.organizationId;
           sessionVenueId = venue.id;
           emergencyType = EmergencyType.VENUE;
@@ -114,12 +141,10 @@ export class EmergencyService {
               role: OrgMemberRole.OWNER,
             },
           });
-          if (
-            !orgOwner ||
-            venue.organization.type !== OrganizationType.BUSINESS
-          ) {
-            throw new ForbiddenException(
-              'You must be bound to this venue (enter invite code) before sending SOS',
+          if (!orgOwner) {
+            throw forbidden(
+              ErrorCode.VENUE_BIND_REQUIRED,
+              'You must be bound to this venue before sending SOS',
             );
           }
           // Business owner: may request SOS for any venue of their org (no invite bind, no proximity check).
@@ -131,18 +156,33 @@ export class EmergencyService {
     } else {
       const subscriber = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { individualSubscriptionActive: true },
+        select: {
+          individualSubscriptionActive: true,
+          subscriptionExpiresAt: true,
+        },
       });
-      const businessOwnerMembership = await this.prisma.organizationMember.findFirst({
-        where: { userId, role: OrgMemberRole.OWNER },
-        include: { organization: { select: { type: true } } },
-      });
-      const isBusinessOwner =
-        businessOwnerMembership?.organization.type === OrganizationType.BUSINESS;
+      // Истёкшая подписка не даёт доступа. Срок null — активация без даты
+      // (демо-режим); такие записи считаем бессрочными, чтобы не отключить тех,
+      // кто пользовался системой до появления этой проверки.
+      const hasActiveSubscription =
+        subscriber?.individualSubscriptionActive === true &&
+        (subscriber.subscriptionExpiresAt === null ||
+          subscriber.subscriptionExpiresAt.getTime() > Date.now());
+      // Владелец организации шлёт SOS без личной подписки.
+      const isOrgOwner =
+        (await this.prisma.organizationMember.count({
+          where: { userId, role: OrgMemberRole.OWNER },
+        })) > 0;
 
-      if (!subscriber?.individualSubscriptionActive && !isBusinessOwner) {
-        throw new ForbiddenException(
-          'Activate an individual plan or bind to a venue to use SOS',
+      if (!hasActiveSubscription && !isOrgOwner) {
+        const expired =
+          subscriber?.individualSubscriptionActive === true &&
+          subscriber.subscriptionExpiresAt !== null;
+        throw forbidden(
+          expired ? ErrorCode.SUBSCRIPTION_EXPIRED : ErrorCode.SUBSCRIPTION_REQUIRED,
+          expired
+            ? 'Individual subscription has expired'
+            : 'Activate an individual plan or bind to a venue to use SOS',
         );
       }
       // Только читаем существующее членство, ничего не создаём. Просто null
@@ -165,53 +205,64 @@ export class EmergencyService {
       },
     });
 
-    await this.redis.addActiveEmergency(session.id);
-    this.wsGateway.emitEmergencyNew(session as unknown as Record<string, unknown>);
+    void this.wsGateway.emitEmergencyNew(
+      session as unknown as Record<string, unknown>,
+    );
     // Fire-and-forget: a slow Expo call must never delay the SOS response.
     void this.pushService.sendSosAlert(session.id);
 
     return session;
   }
 
+  /**
+   * Самый горячий путь: координата прилетает каждые несколько секунд на каждый
+   * активный вызов. Раньше здесь было три запроса (чтение → вставка → повторное
+   * чтение с include) и окно TOCTOU между проверкой статуса и вставкой: вызов
+   * успевали закрыть, а точка всё равно записывалась.
+   *
+   * Теперь одно условное обновление сессии с вложенной вставкой: преконды
+   * (владелец, незакрытость) живут в `where`, так что гонку решает база.
+   */
   async addLocation(sessionId: string, userId: string, dto: CreateLocationDto) {
-    const session = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-    });
-
-    if (!session) {
-      throw new NotFoundException('Session not found');
+    let session;
+    try {
+      session = await this.prisma.emergencySession.update({
+        where: { id: sessionId, userId, status: { not: 'CLOSED' } },
+        data: {
+          locations: {
+            create: {
+              latitude: dto.latitude,
+              longitude: dto.longitude,
+              accuracy: dto.accuracy,
+            },
+          },
+        },
+        include: {
+          user: { select: { id: true, email: true, role: true } },
+          organization: true,
+          venue: true,
+          // Клиенту нужна последняя точка; раньше на каждый пинг всем
+          // получателям улетала история из тридцати координат.
+          locations: { orderBy: { createdAt: 'desc' }, take: 1 },
+        },
+      });
+    } catch (err) {
+      if (!isPrismaRowNotFound(err)) throw err;
+      const existing = await this.prisma.emergencySession.findUnique({
+        where: { id: sessionId },
+        select: { userId: true, status: true },
+      });
+      if (!existing) throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
+      if (existing.userId !== userId) {
+        throw forbidden(ErrorCode.NOT_YOUR_SESSION, 'Not your session');
+      }
+      throw conflict(ErrorCode.SESSION_ALREADY_CLOSED, 'Session is already closed');
     }
 
-    if (session.userId !== userId) {
-      throw new ForbiddenException('Not your session');
-    }
-
-    if (session.status === 'CLOSED') {
-      throw new ConflictException('Session is already closed');
-    }
-
-    const location = await this.prisma.emergencyLocation.create({
-      data: {
-        sessionId,
-        latitude: dto.latitude,
-        longitude: dto.longitude,
-        accuracy: dto.accuracy,
-      },
-    });
-
-    const sessionForEmit = await this.prisma.emergencySession.findUnique({
-      where: { id: sessionId },
-      include: {
-        user: { select: { id: true, email: true, role: true } },
-        organization: true,
-        venue: true,
-        locations: { orderBy: { createdAt: 'desc' }, take: 30 },
-      },
-    });
-
+    const location = session.locations[0];
     this.wsGateway.emitLocationUpdate(
       userId,
-      (sessionForEmit ?? session) as unknown as Record<string, unknown>,
+      session as unknown as Record<string, unknown>,
       location as unknown as Record<string, unknown>,
     );
 
@@ -234,11 +285,13 @@ export class EmergencyService {
         include: { user: { select: { id: true, email: true, role: true } } },
       });
 
-      await this.redis.removeActiveEmergency(sessionId);
       this.wsGateway.emitEmergencyClosed(
         userId,
         updated as unknown as Record<string, unknown>,
       );
+      // Заявитель мог отменить тревогу до того, как её кто-то принял: убираем
+      // карточку у всех дежурных, кому она была предложена.
+      this.wsGateway.emitPoolRemoved(sessionId);
       return updated;
     } catch (err) {
       if (!isPrismaRowNotFound(err)) throw err;
@@ -246,13 +299,16 @@ export class EmergencyService {
         where: { id: sessionId },
         select: { userId: true, status: true },
       });
-      if (!existing) throw new NotFoundException('Session not found');
-      if (existing.userId !== userId) throw new ForbiddenException('Not your session');
-      throw new ConflictException('Session is already closed');
+      if (!existing) throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
+      if (existing.userId !== userId) {
+        throw forbidden(ErrorCode.NOT_YOUR_SESSION, 'Not your session');
+      }
+      throw conflict(ErrorCode.SESSION_ALREADY_CLOSED, 'Session is already closed');
     }
   }
 
-  async getActiveSessions(operatorId: string, page: number, limit: number) {
+  /** Вызовы, назначенные этому оператору, — не «активные вообще». */
+  async getMyAssignedSessions(operatorId: string, page: number, limit: number) {
     const skip = (page - 1) * limit;
     const where = {
       status: { in: ['ASSIGNED' as const, 'IN_PROGRESS' as const] },
@@ -290,6 +346,31 @@ export class EmergencyService {
     ]);
 
     return { data, total, page, limit };
+  }
+
+  /**
+   * Карточка вызова для оператора. Веб доставал её фильтром по списку активных
+   * (`getActive().find()`), поэтому вызов со второй страницы не открывался, а
+   * закрытый — не открывался никогда.
+   *
+   * Отдаём только то, что оператор ведёт или вёл: правило то же, что и у
+   * рассылки событий — полная сессия достаётся тем, кто с ней работает.
+   */
+  async getOperatorSession(sessionId: string, operatorId: string) {
+    const session = await this.prisma.emergencySession.findUnique({
+      where: { id: sessionId },
+      include: OPERATOR_SESSION_INCLUDE,
+    });
+    if (!session) {
+      throw notFound(ErrorCode.SESSION_NOT_FOUND, 'Session not found');
+    }
+    if (session.assignedOperatorId !== operatorId) {
+      throw forbidden(
+        ErrorCode.NOT_ASSIGNED_TO_SESSION,
+        'You are not assigned to this session',
+      );
+    }
+    return session;
   }
 
   async getUserHistory(userId: string, page: number, limit: number) {
