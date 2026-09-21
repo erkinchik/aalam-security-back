@@ -788,6 +788,8 @@ test('админ назначает, переназначает и снимае�
   assert.equal(asg.data.status, 'ASSIGNED');
   assert.equal(asg.data.assignedOperatorId, OPS.a.id);
 
+  // Назначать можно только дежурному — B заступает на смену.
+  await setShift(OPS.b, true);
   const re = await api('POST', `/admin/emergencies/${id}/reassign`, {
     token: T.admin,
     body: { operatorId: OPS.b.id },
@@ -810,6 +812,23 @@ test('админ назначает, переназначает и снимае�
   });
   assertOk(close, 'close');
   assert.equal(close.data.status, 'CLOSED');
+  await setShift(OPS.b, false);
+});
+
+test('админ не назначит вызов оператору вне смены', async () => {
+  const u = await makeSubscribedUser('offshiftassign');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  // B по умолчанию вне смены; назначенный ему вызов он бы не увидел.
+  const r = await api('POST', `/admin/emergencies/${s.data.id}/assign`, {
+    token: T.admin,
+    body: { operatorId: OPS.b.id },
+  });
+  assert.equal(r.status, 409, `${r.status} ${msgOf(r.data)}`);
+  assert.equal(r.data.code, 'NOT_ON_SHIFT');
+  await api('POST', `/admin/emergencies/${s.data.id}/close`, {
+    token: T.admin,
+    body: { resolution: 'off-shift assign cleanup' },
+  });
 });
 
 test('админ не назначит вызов на не-оператора', async () => {

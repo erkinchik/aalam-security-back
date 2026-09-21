@@ -289,10 +289,15 @@ export class AdminService {
   private async assertOperatorCanTakeSession(operatorId: string) {
     const operator = await this.prisma.user.findUnique({
       where: { id: operatorId },
-      select: { role: true, deletedAt: true },
+      select: { role: true, deletedAt: true, onShift: true },
     });
     if (!operator || operator.role !== Role.OPERATOR || operator.deletedAt) {
       throw badRequest(ErrorCode.NOT_AN_OPERATOR, "User is not an operator");
+    }
+    // Вне смены приложение показывает оператору только экран начала смены —
+    // назначенный вызов он бы просто не увидел.
+    if (!operator.onShift) {
+      throw conflict(ErrorCode.NOT_ON_SHIFT, "Operator is not on shift");
     }
 
     const openSessions = await this.prisma.emergencySession.count({
