@@ -8,7 +8,7 @@ export class AddOrganizationMemberDto {
   email: string;
 
   @ApiProperty({ enum: OrgMemberRole, example: 'MEMBER' })
-  @IsEnum(OrgMemberRole, { message: 'Роль должна быть OWNER, MANAGER, OPERATOR или MEMBER' })
+  @IsEnum(OrgMemberRole, { message: 'Роль должна быть OWNER, MANAGER, STAFF или MEMBER' })
   role: OrgMemberRole;
 
   @ApiProperty({

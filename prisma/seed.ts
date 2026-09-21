@@ -1,12 +1,13 @@
-import { PrismaClient, OrganizationType, OrgMemberRole } from '@prisma/client';
+import { PrismaClient, OrgMemberRole } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { generateUniqueInviteCodeAcrossTables } from './lib/invite-code';
 
 const prisma = new PrismaClient();
 
-async function backfillBusinessOrgInviteCodes() {
+async function backfillOrgInviteCodes() {
+  // Тип организации убран — код приглашения нужен каждой.
   const missing = await prisma.organization.findMany({
-    where: { type: OrganizationType.BUSINESS, inviteCode: null },
+    where: { inviteCode: null },
   });
   for (const org of missing) {
     const code = await generateUniqueInviteCodeAcrossTables(prisma);
@@ -120,7 +121,6 @@ async function seedDemoOrganization() {
       data: {
         name: DEMO_ORG.name,
         slug: DEMO_ORG.slug,
-        type: OrganizationType.BUSINESS,
         inviteCode: DEMO_ORG.inviteCode,
       },
     });
@@ -216,7 +216,7 @@ async function main() {
   await seedUsers();
   const org = await seedDemoOrganization();
   await seedDemoMemberships(org.id);
-  await backfillBusinessOrgInviteCodes();
+  await backfillOrgInviteCodes();
   printSummary();
 }
 

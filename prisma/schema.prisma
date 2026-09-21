@@ -21,15 +21,13 @@ enum EmergencyStatus {
   CLOSED
 }
 
-enum OrganizationType {
-  PERSONAL
-  BUSINESS
-}
-
+/// Роль сотрудника внутри организации. STAFF, а не OPERATOR: диспетчер
+/// платформы — это Role.OPERATOR, и одинаковое имя в двух енумах заставляло
+/// каждый раз выяснять, о какой из двух ролей речь.
 enum OrgMemberRole {
   OWNER
   MANAGER
-  OPERATOR
+  STAFF
   MEMBER
 }
 
@@ -85,9 +83,8 @@ model User {
 model Organization {
   id        String   @id @default(uuid())
   name      String
-  type      OrganizationType @default(PERSONAL)
   slug      String   @unique
-  /// Invite code for BUSINESS orgs (employees join without binding to a single venue). Null for PERSONAL.
+  /// Invite code: employees join the company without binding to a single venue.
   inviteCode String? @unique
   createdAt DateTime @default(now())
 

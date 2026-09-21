@@ -1,14 +1,14 @@
 import { Injectable, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
-import { OrgMemberRole, OrganizationType } from '@prisma/client';
+import { OrgMemberRole } from '@prisma/client';
 import { generateUniqueInviteCodeAcrossTables } from '../venue/utils/invite-code';
 
 @Injectable()
 export class OrganizationService {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Create a personal organization for a new user (used during registration) */
+  /** Создаёт компанию и делает автора владельцем. */
   async create(userId: string, dto: CreateOrganizationDto) {
     const alreadyMember = await this.prisma.organizationMember.findUnique({
       where: { userId },
@@ -23,15 +23,11 @@ export class OrganizationService {
     const existingSlug = await this.prisma.organization.findUnique({ where: { slug } });
     const uniqueSlug = existingSlug ? `${slug}-${Date.now().toString(36)}` : slug;
 
-    const inviteCode =
-      dto.type === OrganizationType.BUSINESS
-        ? await generateUniqueInviteCodeAcrossTables(this.prisma)
-        : undefined;
+    const inviteCode = await generateUniqueInviteCodeAcrossTables(this.prisma);
 
     return this.prisma.organization.create({
       data: {
         name: dto.name,
-        type: dto.type,
         slug: uniqueSlug,
         inviteCode,
         members: {
@@ -42,7 +38,13 @@ export class OrganizationService {
     });
   }
 
-  /** Get user's organizations */
+  /**
+   * Только компании. Персональных организаций как понятия нет: раньше на
+   * каждого зарегистрировавшегося заводилась «My Account», и клиент честно
+   * рисовал её как «Моя организация» — пользователь видел контору, в которую
+   * никогда не вступал. Регистрация их больше не создаёт, а оставшиеся в базе
+   * сюда не попадают.
+   */
   async getMyOrganizations(userId: string) {
     return this.prisma.organizationMember.findMany({
       where: { userId },
@@ -54,7 +56,6 @@ export class OrganizationService {
     });
   }
 
-  /** Ensure user has an org (create personal if none) - for legacy compatibility */
   /**
    * Возвращает организацию пользователя, если он в ней состоит, иначе null.
    * Пришло на смену ensureUserHasOrg, который при отсутствии членства СОЗДАВАЛ

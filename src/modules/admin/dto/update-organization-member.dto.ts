@@ -5,7 +5,7 @@ import { OrgMemberRole } from '@prisma/client';
 export class UpdateOrganizationMemberDto {
   @ApiProperty({ enum: OrgMemberRole, required: false })
   @IsOptional()
-  @IsEnum(OrgMemberRole, { message: 'Роль должна быть OWNER, MANAGER, OPERATOR или MEMBER' })
+  @IsEnum(OrgMemberRole, { message: 'Роль должна быть OWNER, MANAGER, STAFF или MEMBER' })
   role?: OrgMemberRole;
 
   @ApiProperty({ required: false, nullable: true, description: 'null — отвязать от объекта' })

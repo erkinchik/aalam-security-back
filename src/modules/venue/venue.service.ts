@@ -4,7 +4,7 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
-import { OrgMemberRole, OrganizationType } from '@prisma/client';
+import { OrgMemberRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OrganizationService } from '../organization/organization.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
@@ -80,7 +80,6 @@ export class VenueService {
     const org = await this.prisma.organization.findFirst({
       where: {
         inviteCode: { equals: code, mode: 'insensitive' },
-        type: OrganizationType.BUSINESS,
       },
       select: { id: true, name: true },
     });
