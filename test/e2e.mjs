@@ -103,10 +103,38 @@ const LOGIN_LIMIT = 5;
 const T = {}; // токены
 const ID = {}; // id пользователей
 
-async function login(email, password) {
+/**
+ * Access-токен живёт 15 минут, а полный прогон с медленными cron-тестами длится
+ * дольше: раньше суточные тесты валились на 401 посреди ожидания. Держим
+ * refresh-токены и обновляем доступ по ходу.
+ */
+const sessions = [];
+
+function trackSession(refreshToken, apply) {
+  sessions.push({ refreshToken, apply });
+}
+
+async function renewSessions() {
+  for (const session of sessions) {
+    const r = await api('POST', '/auth/refresh', {
+      body: { refreshToken: session.refreshToken },
+      skipPace: true,
+    });
+    if (r.status !== 200) continue;
+    session.refreshToken = r.data.refreshToken;
+    session.apply(r.data.accessToken);
+  }
+}
+
+async function loginSession(email, password) {
   const r = await api('POST', '/auth/login', { body: { email, password } });
   assert.equal(r.status, 200, `login ${email}: ${r.status} ${msgOf(r.data)}`);
-  return r.data.accessToken;
+  return r.data;
+}
+
+async function login(email, password) {
+  const { accessToken } = await loginSession(email, password);
+  return accessToken;
 }
 
 async function me(token) {
@@ -136,8 +164,12 @@ async function makeOperator(tag) {
     body: { email, password },
   });
   assertOk(r, 'create-operator');
-  const token = await login(email, password);
-  return { id: r.data.id, email, token };
+  const tokens = await loginSession(email, password);
+  const op = { id: r.data.id, email, token: tokens.accessToken };
+  trackSession(tokens.refreshToken, (accessToken) => {
+    op.token = accessToken;
+  });
+  return op;
 }
 
 const OPS = {};
@@ -154,15 +186,33 @@ async function heartbeat(op) {
 }
 
 before(async () => {
-  T.admin = await login(SEED.admin.email, SEED.admin.password);
-  T.operator = await login(SEED.operator.email, SEED.operator.password);
+  const admin = await loginSession(SEED.admin.email, SEED.admin.password);
+  T.admin = admin.accessToken;
+  trackSession(admin.refreshToken, (accessToken) => {
+    T.admin = accessToken;
+  });
+
+  const operator = await loginSession(SEED.operator.email, SEED.operator.password);
+  T.operator = operator.accessToken;
   T.user = (await makeSubscribedUser('roles')).token;
   ID.operator = (await me(T.operator)).id;
   OPS.a = { id: ID.operator, email: SEED.operator.email, token: T.operator };
+  trackSession(operator.refreshToken, (accessToken) => {
+    T.operator = accessToken;
+    OPS.a.token = accessToken;
+  });
+
   OPS.b = await makeOperator('b');
+
+  let lastRenewAt = Date.now();
   heartbeatTimer = setInterval(() => {
     void heartbeat(OPS.a);
     void heartbeat(OPS.b);
+    // С запасом до истечения: иначе длинный прогон упирается в 401.
+    if (Date.now() - lastRenewAt > 10 * 60_000) {
+      lastRenewAt = Date.now();
+      void renewSessions();
+    }
   }, 12_000);
 });
 
@@ -322,7 +372,10 @@ test('OPERATOR не может стартовать SOS', async () => {
 
 /* ======================= 4. Смена оператора ======================= */
 
-test('смена: изначально не на смене', async () => {
+test('смена: после сдачи оператор не на смене', async () => {
+  // Сид onShift не сбрасывает, а прошлый прогон мог оборваться посреди смены —
+  // поэтому сначала сдаём её сами.
+  await api('POST', '/dispatch/shift/end', { token: OPS.a.token });
   const r = await api('GET', '/dispatch/shift', { token: OPS.a.token });
   assert.equal(r.status, 200);
   assert.equal(r.data.onShift, false);
@@ -1138,6 +1191,85 @@ test('админ не назначит вызов занятому операт�
   });
 });
 
+test('два параллельных «Принять» на разные вызовы: второй получает OPERATOR_BUSY', async (t) => {
+  await setShift(OPS.a, true);
+  const u1 = await makeSubscribedUser('busyrace1');
+  const u2 = await makeSubscribedUser('busyrace2');
+  const s1 = await api('POST', '/emergency/start', { token: u1.token, body: {} });
+  const s2 = await api('POST', '/emergency/start', { token: u2.token, body: {} });
+  // Уборка и при упавшей проверке: иначе A остаётся с вызовом и валит следующие тесты.
+  t.after(async () => {
+    for (const s of [s1, s2]) {
+      await api('POST', `/admin/emergencies/${s.data.id}/close`, {
+        token: T.admin,
+        body: { resolution: 'race cleanup' },
+      });
+    }
+  });
+
+  // Без блокировки строки оператора оба запроса видели «0 открытых» и оба
+  // проходили — у оператора оказывалось два вызова.
+  const [a1, a2] = await Promise.all([
+    api('POST', `/dispatch/${s1.data.id}/accept`, { token: OPS.a.token }),
+    api('POST', `/dispatch/${s2.data.id}/accept`, { token: OPS.a.token }),
+  ]);
+  assert.deepEqual(
+    [a1.status, a2.status].sort(),
+    [200, 409],
+    `ожидались 200 и 409, пришли ${a1.status} и ${a2.status}`,
+  );
+  const lost = a1.status === 409 ? a1 : a2;
+  assert.equal(lost.data.code, 'OPERATOR_BUSY');
+
+});
+
+test('«Назначить» не отбирает вызов, который оператор уже принял', async (t) => {
+  await setShift(OPS.a, true);
+  await setShift(OPS.b, true);
+  const u = await makeSubscribedUser('stalepage');
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  t.after(async () => {
+    await api('POST', `/admin/emergencies/${s.data.id}/close`, {
+      token: T.admin,
+      body: { resolution: 'stale page cleanup' },
+    });
+    await api('POST', '/dispatch/shift/end', { token: OPS.b.token });
+  });
+  const acc = await api('POST', `/dispatch/${s.data.id}/accept`, { token: OPS.a.token });
+  assert.equal(acc.status, 200);
+
+  // Админ со старой страницей жмёт «Назначить» на уже принятый вызов.
+  const r = await api('POST', `/admin/emergencies/${s.data.id}/assign`, {
+    token: T.admin,
+    body: { operatorId: OPS.b.id },
+  });
+  assert.equal(r.status, 409, `${r.status} ${msgOf(r.data)}`);
+  assert.equal(r.data.code, 'SESSION_ALREADY_CLAIMED');
+
+  const detail = await api('GET', `/admin/emergencies/${s.data.id}`, { token: T.admin });
+  assert.equal(detail.data.assignedOperatorId, OPS.a.id, 'вызов остался за тем, кто принял');
+});
+
+test('мусор во входных данных отклоняется с 400, а не роняет сервер', async () => {
+  const u = await makeSubscribedUser('garbage');
+  const badVenue = await api('POST', '/emergency/start', { token: u.token, body: { venueId: 123 } });
+  assert.equal(badVenue.status, 400, `venueId=123: ${badVenue.status}`);
+
+  const badDate = await api('GET', '/admin/emergencies?from=garbage', { token: T.admin });
+  assert.equal(badDate.status, 400, `from=garbage: ${badDate.status}`);
+
+  const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
+  assertOk(s, 'start');
+  const badPoint = await api('POST', `/emergency/${s.data.id}/location`, {
+    token: u.token,
+    body: { latitude: 999, longitude: -999, accuracy: 5 },
+  });
+  assert.equal(badPoint.status, 400, `координаты вне диапазона: ${badPoint.status}`);
+  assert.ok(badPoint.data.errors?.length, 'подробности валидации обязаны прийти в errors');
+
+  await api('POST', `/emergency/${s.data.id}/close`, { token: u.token });
+});
+
 test('карточка вызова доступна назначенному оператору и закрытая тоже', async () => {
   const u = await makeSubscribedUser('detail1');
   const s = await api('POST', '/emergency/start', { token: u.token, body: {} });
@@ -1257,6 +1389,13 @@ test('админ правит оператора, меняет пароль и �
   const del = await api('DELETE', `/admin/operators/${op.id}`, { token: T.admin });
   assert.equal(del.status, 200);
   assert.equal(del.data.deleted, true);
+
+  // Токен, выданный до удаления, больше не работает. Раньше он жил до истечения
+  // (15 минут): удалённый мог заступить на смену и получать карточки вызовов.
+  const stale = await api('GET', '/dispatch/shift', { token: freshToken });
+  assert.equal(stale.status, 401, 'токен удалённого оператора обязан перестать работать');
+  const staleShift = await api('POST', '/dispatch/shift/start', { token: freshToken });
+  assert.equal(staleShift.status, 401, 'удалённый оператор не заступает на смену');
 
   // Войти нельзя, в списке нет, карточки нет, назначить нельзя.
   const afterLogin = await api('POST', '/auth/login', {
