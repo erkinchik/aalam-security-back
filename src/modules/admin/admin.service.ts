@@ -29,6 +29,7 @@ import {
 } from "../../common/errors/app.exception";
 import { anonymizedEmailFor } from "../../common/constants/anonymize";
 import { OPERATOR_SESSION_INCLUDE } from "../../common/prisma/operator-session.include";
+import { lockOperatorRow } from "../../common/prisma/operator-lock";
 import {
   isHeartbeatFresh,
   parseHeartbeat,
@@ -161,17 +162,19 @@ export class AdminService {
   }
 
   async assignSession(sessionId: string, operatorId: string) {
-    await this.assertOperatorCanTakeSession(operatorId);
-
     try {
-      // REL-1: conditional update — fails if session was closed concurrently.
-      const updated = await this.prisma.emergencySession.update({
-        where: { id: sessionId, status: { not: "CLOSED" } },
-        data: {
-          assignedOperatorId: operatorId,
-          status: "ASSIGNED",
-        },
-        include: OPERATOR_SESSION_INCLUDE,
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await this.assertOperatorCanTakeSession(tx, operatorId);
+        // Только свободный вызов. Устаревшая страница админки иначе молча
+        // отбирала вызов у оператора, который его только что принял.
+        return tx.emergencySession.update({
+          where: { id: sessionId, status: { not: "CLOSED" }, assignedOperatorId: null },
+          data: {
+            assignedOperatorId: operatorId,
+            status: "ASSIGNED",
+          },
+          include: OPERATOR_SESSION_INCLUDE,
+        });
       });
 
       this.wsGateway.emitEmergencyAssigned(
@@ -185,15 +188,20 @@ export class AdminService {
       if (!isPrismaRowNotFound(err)) throw err;
       const existing = await this.prisma.emergencySession.findUnique({
         where: { id: sessionId },
-        select: { status: true },
+        select: { status: true, assignedOperatorId: true },
       });
-      if (!existing) throw new NotFoundException("Session not found");
-      throw new ConflictException(`Session is ${existing.status}`);
+      if (!existing) throw notFound(ErrorCode.SESSION_NOT_FOUND, "Session not found");
+      if (existing.status === "CLOSED") {
+        throw conflict(ErrorCode.SESSION_ALREADY_CLOSED, "Session is already closed");
+      }
+      throw conflict(
+        ErrorCode.SESSION_ALREADY_CLAIMED,
+        "Session is already assigned — use reassign",
+      );
     }
   }
 
   async reassignSession(sessionId: string, operatorId: string) {
-    await this.assertOperatorCanTakeSession(operatorId);
     // Прежний исполнитель нужен, чтобы сказать ему, что вызов ушёл. Условный
     // update вернёт уже новое состояние, поэтому читаем заранее. Гонка здесь
     // безобидна: в худшем случае уведомим того, кто и так потерял вызов.
@@ -203,18 +211,21 @@ export class AdminService {
     });
 
     try {
-      // REL-1: also rejects re-assignment to the same operator atomically.
-      const updated = await this.prisma.emergencySession.update({
-        where: {
-          id: sessionId,
-          status: { not: "CLOSED" },
-          assignedOperatorId: { not: operatorId },
-        },
-        data: {
-          assignedOperatorId: operatorId,
-          status: "ASSIGNED",
-        },
-        include: OPERATOR_SESSION_INCLUDE,
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await this.assertOperatorCanTakeSession(tx, operatorId);
+        // REL-1: also rejects re-assignment to the same operator atomically.
+        return tx.emergencySession.update({
+          where: {
+            id: sessionId,
+            status: { not: "CLOSED" },
+            assignedOperatorId: { not: operatorId },
+          },
+          data: {
+            assignedOperatorId: operatorId,
+            status: "ASSIGNED",
+          },
+          include: OPERATOR_SESSION_INCLUDE,
+        });
       });
 
       this.wsGateway.emitEmergencyReassigned(
@@ -262,8 +273,10 @@ export class AdminService {
         before?.assignedOperatorId,
       );
       // Вызов снова свободен — предлагаем его дежурным, как обычный новый.
+      // Админам не шлём: сирена от собственного действия только мешает.
       void this.wsGateway.emitPoolReturned(
         updated as unknown as Record<string, unknown>,
+        { notifyAdmins: false },
       );
       return updated;
     } catch (err) {
@@ -286,8 +299,17 @@ export class AdminService {
    * и второй назначенный вызов стал бы невидимым — при том что сдать смену с
    * ним нельзя. Удалённых в назначение тоже не пускаем.
    */
-  private async assertOperatorCanTakeSession(operatorId: string) {
-    const operator = await this.prisma.user.findUnique({
+  /**
+   * Вызывается внутри транзакции назначения: блокировка строки оператора
+   * сериализует проверку «нет открытых вызовов» с записью — и с его
+   * собственным приёмом вызова (см. lockOperatorRow).
+   */
+  private async assertOperatorCanTakeSession(
+    tx: Prisma.TransactionClient,
+    operatorId: string,
+  ) {
+    await lockOperatorRow(tx, operatorId);
+    const operator = await tx.user.findUnique({
       where: { id: operatorId },
       select: { role: true, deletedAt: true, onShift: true },
     });
@@ -300,7 +322,7 @@ export class AdminService {
       throw conflict(ErrorCode.NOT_ON_SHIFT, "Operator is not on shift");
     }
 
-    const openSessions = await this.prisma.emergencySession.count({
+    const openSessions = await tx.emergencySession.count({
       where: {
         assignedOperatorId: operatorId,
         status: { in: OPEN_ASSIGNED_STATUSES },
@@ -470,36 +492,42 @@ export class AdminService {
   async deleteOperator(operatorId: string) {
     await this.assertOperatorExists(operatorId);
 
-    const openSessions = await this.prisma.emergencySession.count({
-      where: {
-        assignedOperatorId: operatorId,
-        status: { in: OPEN_ASSIGNED_STATUSES },
-      },
-    });
-    if (openSessions > 0) {
-      throw conflict(
-        ErrorCode.SHIFT_HAS_OPEN_SESSIONS,
-        `Operator still has ${openSessions} open session(s)`,
-        { openSessions },
-      );
-    }
+    // Хеш считаем до транзакции: bcrypt занимает сотни миллисекунд, и держать всё
+    // это время блокировку строки оператора незачем.
+    const unusablePassword = await bcrypt.hash(
+      crypto.randomBytes(32).toString("hex"),
+      BCRYPT_COST,
+    );
+    // Проверка «нет открытых вызовов» и удаление — под блокировкой строки
+    // оператора, как у приёма вызова: иначе принятый между ними вызов оставался
+    // на удалённом.
+    const wasOnShift = await this.prisma.$transaction(async (tx) => {
+      await lockOperatorRow(tx, operatorId);
+      const openSessions = await tx.emergencySession.count({
+        where: {
+          assignedOperatorId: operatorId,
+          status: { in: OPEN_ASSIGNED_STATUSES },
+        },
+      });
+      if (openSessions > 0) {
+        throw conflict(
+          ErrorCode.SHIFT_HAS_OPEN_SESSIONS,
+          `Operator still has ${openSessions} open session(s)`,
+          { openSessions },
+        );
+      }
+      const before = await tx.user.findUnique({
+        where: { id: operatorId },
+        select: { onShift: true },
+      });
 
-    const wasOnShift = await this.prisma.user.findUnique({
-      where: { id: operatorId },
-      select: { onShift: true },
-    });
-
-    await this.prisma.$transaction(async (tx) => {
       await tx.organizationMember.deleteMany({ where: { userId: operatorId } });
       await tx.passwordResetToken.deleteMany({ where: { userId: operatorId } });
       await tx.user.update({
         where: { id: operatorId },
         data: {
           email: anonymizedEmailFor(operatorId),
-          password: await bcrypt.hash(
-            crypto.randomBytes(32).toString("hex"),
-            BCRYPT_COST,
-          ),
+          password: unusablePassword,
           displayName: null,
           phone: null,
           phoneVerifiedAt: null,
@@ -511,13 +539,15 @@ export class AdminService {
           deletedAt: new Date(),
         },
       });
+      return before?.onShift ?? false;
     });
 
     await this.refreshTokens.removeAllForUser(operatorId);
-    if (wasOnShift?.onShift) {
+    if (wasOnShift) {
       this.wsGateway.emitShiftEnded(operatorId, "admin");
       await this.wsGateway.setOperatorShiftRoom(operatorId, false);
     }
+    this.wsGateway.disconnectUser(operatorId);
 
     this.logger.log(`Admin soft-deleted operator ${operatorId}`);
     return { id: operatorId, deleted: true };
@@ -547,28 +577,32 @@ export class AdminService {
       throw new BadRequestException("User is not an operator");
     }
 
-    if (!onShift) {
-      const activeSessionCount = await this.prisma.emergencySession.count({
-        where: {
-          assignedOperatorId: operatorId,
-          status: { in: OPEN_ASSIGNED_STATUSES },
-        },
-      });
-      if (activeSessionCount > 0) {
-        throw new ConflictException(
-          `У оператора ${activeSessionCount} незакрытых вызовов. ` +
-            "Переназначьте или закройте их перед снятием со смены.",
-        );
+    // Проверка и запись под блокировкой строки оператора — как у приёма вызова,
+    // иначе вызов, принятый между ними, оставался на операторе вне смены.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await lockOperatorRow(tx, operatorId);
+      if (!onShift) {
+        const activeSessionCount = await tx.emergencySession.count({
+          where: {
+            assignedOperatorId: operatorId,
+            status: { in: OPEN_ASSIGNED_STATUSES },
+          },
+        });
+        if (activeSessionCount > 0) {
+          throw new ConflictException(
+            `У оператора ${activeSessionCount} незакрытых вызовов. ` +
+              "Переназначьте или закройте их перед снятием со смены.",
+          );
+        }
       }
-    }
-
-    const updated = await this.prisma.user.update({
-      where: { id: operatorId },
-      data: {
-        onShift,
-        shiftStartedAt: onShift ? new Date() : null,
-      },
-      select: { id: true, email: true, onShift: true, shiftStartedAt: true },
+      return tx.user.update({
+        where: { id: operatorId },
+        data: {
+          onShift,
+          shiftStartedAt: onShift ? new Date() : null,
+        },
+        select: { id: true, email: true, onShift: true, shiftStartedAt: true },
+      });
     });
     if (!onShift) this.wsGateway.emitShiftEnded(operatorId, "admin");
     await this.wsGateway.setOperatorShiftRoom(operatorId, onShift);

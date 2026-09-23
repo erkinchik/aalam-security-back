@@ -281,11 +281,19 @@ export class WebsocketGateway
    * Свободные дежурные должны увидеть его как обычное предложение, поэтому
    * событие то же самое: клиенту незачем различать «новый» и «вернувшийся».
    */
-  async emitPoolReturned(session: Record<string, unknown>) {
-    await this.offerToFreeOperators(session);
+  async emitPoolReturned(
+    session: Record<string, unknown>,
+    { notifyAdmins = true }: { notifyAdmins?: boolean } = {},
+  ) {
+    await this.offerToFreeOperators(session, notifyAdmins);
   }
 
-  private async offerToFreeOperators(session: Record<string, unknown>) {
+  /**
+   * `includeAdmins: false` — когда вызов вернул в пул сам админ: emergency:new
+   * включает у него сирену, а о своём же действии сигналить незачем. Список у
+   * админа обновит emergency:reassigned, которое уходит в admin_room всегда.
+   */
+  private async offerToFreeOperators(session: Record<string, unknown>, includeAdmins = true) {
     let busyRooms: string[] = [];
     try {
       busyRooms = await this.busyOperatorRooms();
@@ -298,7 +306,7 @@ export class WebsocketGateway
       );
     }
     this.server
-      .to(['admin_room', ON_SHIFT_ROOM])
+      .to(includeAdmins ? ['admin_room', ON_SHIFT_ROOM] : [ON_SHIFT_ROOM])
       .except(busyRooms)
       .emit('emergency:new', session);
   }

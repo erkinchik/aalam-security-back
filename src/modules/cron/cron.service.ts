@@ -13,6 +13,7 @@ import {
   isHeartbeatFresh,
 } from '../../common/constants/operator-presence';
 import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
+import { lockOperatorRow } from '../../common/prisma/operator-lock';
 
 const STALE_LOCK_KEY = 'cron:stale-assignments';
 const SUBSCRIPTION_LOCK_KEY = 'cron:expire-subscriptions';
@@ -174,24 +175,35 @@ export class CronService {
         });
       if (dead.length === 0) return;
 
-      // Условие повторено в самой записи: вызов мог появиться у оператора
-      // между выборкой и обновлением.
-      await this.prisma.user.updateMany({
-        where: {
-          id: { in: dead },
-          assignedSessions: { none: { status: { in: OPEN_ASSIGNED_STATUSES } } },
-        },
-        data: { onShift: false, shiftStartedAt: null },
-      });
+      // По одному и под той же блокировкой строки оператора, что у приёма
+      // вызова: условие «нет открытых» иначе не видело вызов, принятый, пока
+      // запрос ждал. Событие — только тем, с кого смену правда сняли.
+      const ended: string[] = [];
+      for (const id of dead) {
+        const count = await this.prisma.$transaction(async (tx) => {
+          await lockOperatorRow(tx, id);
+          const result = await tx.user.updateMany({
+            where: {
+              id,
+              onShift: true,
+              assignedSessions: { none: { status: { in: OPEN_ASSIGNED_STATUSES } } },
+            },
+            data: { onShift: false, shiftStartedAt: null },
+          });
+          return result.count;
+        });
+        if (count > 0) ended.push(id);
+      }
+      if (ended.length === 0) return;
       await Promise.all(
-        dead.map(async (id) => {
+        ended.map(async (id) => {
           // Событие уходит до выхода из комнаты — иначе оно не дойдёт.
           this.wsGateway.emitShiftEnded(id, 'inactivity');
           await this.wsGateway.setOperatorShiftRoom(id, false);
         }),
       );
       this.logger.warn(
-        `Ended shift for ${dead.length} unreachable operator(s): ${dead.join(', ')}`,
+        `Ended shift for ${ended.length} unreachable operator(s): ${ended.join(', ')}`,
       );
     } catch (error) {
       this.logger.error('Failed to drop dead operator shifts', error as Error);

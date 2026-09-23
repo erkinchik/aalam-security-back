@@ -7,6 +7,7 @@ import { isPrismaRowNotFound } from '../../common/utils/prisma-errors';
 import { ErrorCode } from '../../common/errors/error-codes';
 import { conflict, forbidden, notFound } from '../../common/errors/app.exception';
 import { OPERATOR_SESSION_INCLUDE } from '../../common/prisma/operator-session.include';
+import { lockOperatorRow } from '../../common/prisma/operator-lock';
 import { OPEN_ASSIGNED_STATUSES } from '../../common/constants/operator-presence';
 
 @Injectable()
@@ -164,17 +165,23 @@ export class DispatchService {
   }
 
   async endShift(operatorId: string) {
-    // Условие «нет открытых вызовов» живёт в самом запросе: между отдельной
-    // проверкой и обновлением админ успевал назначить вызов, и оператор уходил
-    // со смены с висящим на нём выездом.
-    const { count } = await this.prisma.user.updateMany({
-      where: {
-        id: operatorId,
-        assignedSessions: {
-          none: { status: { in: OPEN_ASSIGNED_STATUSES } },
+    // Условие «нет открытых вызовов» живёт в самом запросе, а перед ним — та же
+    // блокировка строки оператора, что у приёма вызова. Без неё приём, успевший
+    // закоммититься, пока этот запрос ждал, не был виден подзапросу условия
+    // (Postgres перепроверяет только саму строку), и оператор уходил со смены с
+    // висящим на нём вызовом.
+    const count = await this.prisma.$transaction(async (tx) => {
+      await lockOperatorRow(tx, operatorId);
+      const result = await tx.user.updateMany({
+        where: {
+          id: operatorId,
+          assignedSessions: {
+            none: { status: { in: OPEN_ASSIGNED_STATUSES } },
+          },
         },
-      },
-      data: { onShift: false, shiftStartedAt: null },
+        data: { onShift: false, shiftStartedAt: null },
+      });
+      return result.count;
     });
 
     if (count === 0) {
@@ -236,39 +243,46 @@ export class DispatchService {
    * gets P2025 rather than silently stealing an already-claimed session.
    */
   async acceptSession(sessionId: string, operatorId: string) {
-    const [operator, openAssigned] = await Promise.all([
-      this.prisma.user.findUnique({
-        where: { id: operatorId },
-        select: { onShift: true },
-      }),
-      this.countOpenAssigned(operatorId),
-    ]);
-    if (!operator?.onShift) {
-      throw forbidden(
-        ErrorCode.NOT_ON_SHIFT,
-        'Operator must be on shift to accept calls',
-      );
-    }
-    if (openAssigned > 0) {
-      throw conflict(
-        ErrorCode.OPERATOR_BUSY,
-        `Operator already has ${openAssigned} open session(s)`,
-        { openSessions: openAssigned },
-      );
-    }
-
     try {
-      const updated = await this.prisma.emergencySession.update({
-        where: {
-          id: sessionId,
-          status: EmergencyStatus.NEW,
-          assignedOperatorId: null,
-        },
-        data: {
-          status: EmergencyStatus.ASSIGNED,
-          assignedOperatorId: operatorId,
-        },
-        include: OPERATOR_SESSION_INCLUDE,
+      const updated = await this.prisma.$transaction(async (tx) => {
+        // Проверки и запись под одной блокировкой оператора — иначе два
+        // параллельных приёма разных вызовов оба видели «0 открытых».
+        await lockOperatorRow(tx, operatorId);
+        const operator = await tx.user.findUnique({
+          where: { id: operatorId },
+          select: { onShift: true },
+        });
+        if (!operator?.onShift) {
+          throw forbidden(
+            ErrorCode.NOT_ON_SHIFT,
+            'Operator must be on shift to accept calls',
+          );
+        }
+        const openAssigned = await tx.emergencySession.count({
+          where: {
+            assignedOperatorId: operatorId,
+            status: { in: OPEN_ASSIGNED_STATUSES },
+          },
+        });
+        if (openAssigned > 0) {
+          throw conflict(
+            ErrorCode.OPERATOR_BUSY,
+            `Operator already has ${openAssigned} open session(s)`,
+            { openSessions: openAssigned },
+          );
+        }
+        return tx.emergencySession.update({
+          where: {
+            id: sessionId,
+            status: EmergencyStatus.NEW,
+            assignedOperatorId: null,
+          },
+          data: {
+            status: EmergencyStatus.ASSIGNED,
+            assignedOperatorId: operatorId,
+          },
+          include: OPERATOR_SESSION_INCLUDE,
+        });
       });
 
       this.wsGateway.emitEmergencyAssigned(
