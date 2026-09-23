@@ -56,6 +56,16 @@ export class UsersService {
       data.displayName = dto.displayName;
     }
     data.phone = dto.phone;
+    // Подтверждение относится к конкретному номеру. Сменил номер — отметка
+    // больше ничего не доказывает. Телефон приходит в каждом PATCH, поэтому
+    // сравниваем, иначе правка одного имени сбрасывала бы верификацию.
+    const current = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { phone: true },
+    });
+    if (current && current.phone !== dto.phone) {
+      data.phoneVerifiedAt = null;
+    }
 
     if (Object.keys(data).length === 0) {
       return this.findMe(userId);

@@ -225,6 +225,9 @@ export class AuthService implements OnModuleInit {
       }),
       this.prisma.passwordResetToken.delete({ where: { id: record.id } }),
     ]);
+    // Сброс пароля — обычно реакция на подозрение, что кто-то вошёл. Старые
+    // сессии должны закончиться вместе со старым паролем.
+    await this.refreshTokens.removeAllForUser(record.userId);
 
     return { status: 'ok' };
   }
