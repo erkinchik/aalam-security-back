@@ -25,9 +25,13 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   async validate(payload: JwtPayload) {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
+      select: { id: true, email: true, role: true, deletedAt: true },
     });
 
-    if (!user) {
+    // Удалённая учётка теряет доступ сразу, а не когда истечёт access-токен:
+    // иначе удалённый оператор ещё 15 минут мог заступить на смену и получать
+    // карточки вызовов с данными заявителей.
+    if (!user || user.deletedAt) {
       throw new UnauthorizedException('User not found');
     }
 

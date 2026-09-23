@@ -245,6 +245,15 @@ export class WebsocketGateway
   }
 
   /**
+   * Закрывает все сокеты пользователя. Нужен после удаления учётки: проверка
+   * `deletedAt` идёт только при подключении, и открытый сокет иначе продолжал
+   * получать события.
+   */
+  disconnectUser(userId: string) {
+    this.server.in([operatorRoom(userId), `user_${userId}`]).disconnectSockets(true);
+  }
+
+  /**
    * Moves every socket of this operator in or out of the on-shift broadcast
    * room. Called by the shift endpoints, which have no socket reference.
    */
