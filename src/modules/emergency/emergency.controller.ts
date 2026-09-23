@@ -17,6 +17,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { EmergencyService } from './emergency.service';
 import { CreateLocationDto } from './dto/create-location.dto';
+import { StartEmergencyDto } from './dto/start-emergency.dto';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 @ApiTags('Emergency')
@@ -31,7 +32,9 @@ export class EmergencyController {
   @ApiOperation({ summary: 'Start a new SOS emergency session' })
   start(
     @CurrentUser() user: { id: string },
-    @Body() body?: { venueId?: string },
+    // DTO-класс, а не тип в скобках: иначе ValidationPipe тело не проверял, и
+    // {venueId: 123} ронял сервер с 500.
+    @Body() body: StartEmergencyDto,
   ) {
     return this.emergencyService.startSession(user.id, body?.venueId);
   }
